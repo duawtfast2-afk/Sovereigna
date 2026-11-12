@@ -1,832 +1,715 @@
-# M2 — Accountless visitor identity and personal workspace: architecture specification
+# M2 Architecture Specification — Revision 4
 
-**M2 Architecture Specification — Revision 3** (2026-11-13). Revisions 1 and 2 are superseded by this text.
+**Accountless visitors, personal workspaces and agent Tasks for the public beta** (2026-11-13). Revisions 1–3 are superseded by this text.
 
-Status: **specification only. Not approved for implementation.** No code, migration or test described here exists yet. Revising this document does not approve any design decision in it.
-Supersedes the account-based M2 design (Supabase Auth sign-up/sign-in, verified email, `auth.users`-keyed identity) for M2 only.
-Decision register: §11. Each entry is labelled as an **accepted product requirement**, a **recommended design awaiting user approval**, an **unresolved technical prerequisite**, or **deferred to a later milestone**. Only the first label means approved.
+Status: **specification only. Not approved for implementation or deployment.** No code, migration or test described here exists yet. No hosted verification has been performed. Revising this document approves nothing in it; §13 records what is confirmed by the client and what is only recommended.
 
-Change rule (docs/README.md): before implementation this specification needs (1) a new ADR in `docs/DECISIONS/` superseding the affected parts of ADR-0001, ADR-0005, ADR-0006 and ADR-0011, (2) updates to the living documents listed in §12, and (3) a ROADMAP status update. None of those has been made; this document does not edit them.
+Change rule (docs/README.md): before implementation this specification needs (1) a new ADR in `docs/DECISIONS/`, (2) updates to the living documents listed in §15, and (3) a ROADMAP status update. None of those has been made; this document does not edit them.
 
-### Changes from revision 2
-- §5.5, §5.6, §6.3, §6.5, §6.6: **initial sessions and rotation successors are separate paths**, selected by an immutable `origin` column. Initial first use never touches another row; successor first use locks and completes its predecessor, with lineage checks that fail closed (new state `invalid_lineage`). Pending successors are not accepted by the database context until completed.
-- §2.1, §5.10: the provisioning guarantee is stated **per nonce**. Different nonces may create different visitors; tab coordination is only a mitigation; cleanup accounts for it.
-- §5.11, §6.3, §6.6: rate limits are enforced **inside** the database functions with a canonical subject per bucket. The generic `consume_rate_limit` function is removed; `sovereign_app` can no longer choose a subject or skip the global breaker. Username changes go through a function that derives the visitor from the transaction context.
-- §5.6, §6.3, §6.6: reuse and lineage events are recorded in a restricted database table; `touch_session` returns only a session id for them; event-write failure fails closed.
-- §6.2, §6.8: test cleanup uses a development-only role and target marker, with identity checks that abort before any delete.
-- §2.6, §7.6: the explicit "Start a new workspace" flow clears the invalid cookie first, then obtains a nonce through the normal `GET`.
-- §6.6: maintenance privileges are column-level; cleanup cannot read token or nonce hashes.
+### Changes from revision 3
+- **Scope (§1):** the client-confirmed product — a memecoin-related website showing a Contract Address as information only, where visitors try agents immediately. No wallet, signing or on-chain features. Beta of about 1–2 months.
+- **Agent Tasks are now the primary concern (§5–§6):** a minimal, durable Task lifecycle (submit → queued → running → succeeded / failed / cancelled), a worker that claims Tasks from Postgres, one bounded model call per attempt, result persistence, polling for status, and cost controls.
+- **Identity simplified (§4):** rotation, predecessor/successor lineage, grace periods, reuse detection, session events, the provisioning nonce, username editing and uniqueness, per-network HMAC key versioning, the maintenance owner role and the development cleanup role are **removed or deferred**. Kept: 256-bit tokens, hashes only, HttpOnly/Secure/`SameSite=Lax` cookie, server-side validation, expiry, revocation, CSRF/Origin checks, RLS isolation, no client-trusted ids.
+- **Abuse and cost (§6):** mandatory global ceilings, per-visitor Task limits, input and output caps, timeouts, concurrency limits and a kill switch. Per-network limiting depends on a trusted client-IP source (client decision).
+- **Database (§7):** one application role, one worker role, one `NOLOGIN` function owner. Tables: `visitors`, `workspaces`, `visitor_sessions`, `tasks`, plus small settings, counter and usage tables.
+- **Launch boundary (§10–§11):** a prioritised checklist and a prerequisite table stating what blocks the first beta and what has a simpler alternative.
+- **Decision register (§13):** D1–D24 re-statused; D25–D37 added.
 
 ---
 
-## 1. Goal and principles
+## 1. Confirmed product scope and beta objective
 
-Sovereign is **accountless**. A visitor opens Sovereign and uses it immediately. There is no sign-up, sign-in, password, email confirmation or password recovery anywhere in the product.
+### 1.1 Confirmed by the client (2026-11-13)
+- Sovereign is a memecoin-related website that **displays a Contract Address as informational content**. It is **not** a crypto transaction application. (The address is already rendered by the landing page from `apps/web/src/components/landing/launchConfig.ts`; it is static content.)
+- Visitors open the website and **try its agent features immediately**.
+- Visitors are **never** asked to sign up, log in, sign in, connect a wallet, sign a message or perform a blockchain transaction.
+- Visitors **submit Tasks to agents** and expect useful, relevant outputs that match their Tasks.
+- Each visitor has a **display username**, which is **not** a credential.
+- Each visitor has **one personal workspace** that persists in the same browser profile on the same device.
+- **No cross-device recovery.** Clearing browser data, deleting the profile or losing the session cookie may make the previous workspace inaccessible; this is accepted.
+- **Out of the product entirely:** wallet connection, wallet ownership verification, message signing, swaps, token purchases, claims, any on-chain transaction.
+- The public beta may last **about 1–2 months**. Further investment depends on visitor feedback.
 
-1. **No hidden accounts.** Supabase Auth is not the foundation of visitor identity: no `auth.users` rows, no `auth.uid()`, no Supabase Auth sessions, no anonymous Supabase sign-ins.
-2. **The browser holds a credential, nothing else.** A random, opaque session token in an HttpOnly cookie is the only proof of workspace ownership. The username and the visitor id are never credentials.
-3. **One backend, one door.** Browser code never talks to the database or to Supabase APIs for visitor data. Every read and write goes through the Sovereign server (Next.js server code), which establishes the visitor context.
-4. **Least privilege, honestly described.** The server connects with a dedicated database role without `BYPASSRLS`. RLS is defence in depth against application bugs; it is **not** protection against a compromised server or against arbitrary SQL run as the application role (§6.5, §6.7).
-5. **Fail closed.** A missing, malformed, expired, rotated-out, revoked or inconsistent session yields "no visitor", never another visitor's data. Missing security configuration disables the affected feature instead of weakening it.
-6. **Accepted limitation, stated plainly.** Losing the cookie or the browser profile means losing access to the workspace. There is no recovery.
+### 1.2 Beta objective
+Put a **usable, secure, cost-controlled** agent experience in front of visitors quickly. Build only what makes Tasks work reliably and keeps each visitor's data private. Everything else waits for feedback.
 
-Out of scope for M2: cross-device recovery or transfer, email of any kind, operator/admin identity, public profiles, Realtime, agent runs and budgets, teams. §10 lists the consequences for later milestones.
+### 1.3 Terminology
+- **Task** (visitor-facing) = the beta's unit of work: one visitor's instruction to one agent and the agent's output. In the blueprint's vocabulary it is a simplified single-agent quest/decree with one run; §5.1 maps it.
+- **Agent** = a platform-defined agent the visitor can choose (§5.2). Visitors do not create agents in the beta.
 
 ---
 
-## 2. Product behaviour
+## 2. Architecture at a glance
 
-### 2.1 First visit
-- Public pages (landing, Realm, Orders and the other `(realm)` routes) need no visitor identity and create none.
-- When a browser with neither a session cookie nor a provisioning-nonce cookie enters the application area (M2: `/workspace`):
-  1. The response to that `GET` sets a short-lived **provisioning nonce cookie** (§5.10). No database row is created by any `GET`.
-  2. The app shell's client component sends one same-origin `POST` (Server Action) automatically, without any form or click.
-  3. The server creates the visitor, the personal workspace and a session atomically (§7.1), sets the session cookie and returns the workspace view.
-- **Guarantee:** all provisioning requests that carry the **same nonce** resolve to the **same visitor** (§5.10). Requests carrying **different** nonces may create different visitors — for example when several tabs load at almost the same moment and their responses interleave. One visitor per browser is the usual outcome, not a guarantee.
-- Crawlers and link previews that do not run JavaScript create nothing.
+```
+Browser ──HTTPS──▶ Next.js server (apps/web)                      Worker (apps/worker, long-running Node)
+  session cookie     • validates session (hash lookup)              • claims queued Tasks (SKIP LOCKED + lease)
+  (HttpOnly)         • Server Actions: provision, submit, cancel    • one bounded model call per attempt
+                     • reads own workspace/Tasks under RLS          • writes result / error, records usage
+                     • connects as sovereign_app                    • connects as sovereign_worker
+                              │                                               │
+                              ▼                                               ▼
+                       Supabase PostgreSQL (schema `sovereign` + `private`, RLS on every table)
+                                                                              │
+                                                              Model provider API (Anthropic, ADR-0001/§F.1)
+```
 
-### 2.2 Returning visit
-- The browser sends the session cookie. The server validates it (§5.6), resolves the visitor and renders the workspace.
-- Persistence across browser restarts on the same browser profile and device comes from a **persistent** cookie (`Max-Age`, §5.4).
+- **Browser** holds only the session cookie. It never talks to Supabase or the model provider.
+- **Web server** holds the `sovereign_app` database credential. It never holds the model API key.
+- **Worker** holds the `sovereign_worker` database credential and the model API key. It never reads visitor sessions.
+- **No Realtime, no queue extension, no Supabase Auth, no Data API use** in the beta (§3).
 
-### 2.3 Username
-- Every visitor has exactly one visible username: display identity only.
-- The server generates an initial username on provisioning (§4.2). The visitor can edit it later (§7.3).
-- The username is **never** used to look up, authorise or prove ownership of anything.
+Security properties, in one place:
+- Visitor isolation is enforced **twice**: application code always derives the workspace from the validated session, and RLS on `sovereign` tables filters every `sovereign_app` query by that session (§7.5–§7.6).
+- `sovereign_app` cannot write any table directly; all writes go through small SECURITY DEFINER functions that derive the visitor from the transaction's session context (§7.4).
+- The token hash, not a visitor id, is the database context, so code running SQL as `sovereign_app` can act only as visitors whose token hash it already holds. This is defence in depth, **not** protection against a compromised web server (§7.6).
 
-### 2.4 Personal workspace
-- Each visitor has exactly one personal workspace, created together with the visitor. Ownership is the database relationship `workspaces.visitor_id`, enforced one-to-one (§6.3).
-- M2 workspace content is its name and identity only. Domain data arrives in later milestones with its own tables.
+---
 
-### 2.5 Browser persistence and its limits
-| Event | Result |
+## 3. Re-evaluation of Revision 3 for the beta
+
+| Revision 3 element | Classification | Beta decision |
+|---|---|---|
+| 256-bit token, hash-only storage, HttpOnly/Secure cookie, server-side validation | **REQUIRED BEFORE PUBLIC LAUNCH** | Kept (§4). |
+| `SameSite=Lax`, Origin + `Sec-Fetch-Site` checks on every `POST` | **REQUIRED BEFORE PUBLIC LAUNCH** | Kept (§4.7). |
+| RLS isolation with a token-hash context, `sovereign_app` without `BYPASSRLS` | **REQUIRED BEFORE PUBLIC LAUNCH** | Kept (§7). |
+| 180-day sliding lifetime | **SIMPLIFY FOR BETA** | One sliding idle lifetime, configurable; proposed 90 days (longer than the beta). Same renewal rule (§4.4). |
+| 30-day rotation, predecessor/successor lineage, grace period, reuse detection, `session_events` | **DEFER UNTIL VALIDATED** | Removed. Trade-off in §4.8: a stolen cookie stays valid until expiry or revocation. |
+| Provisioning nonce and per-nonce idempotency | **NOT REQUIRED FOR THIS PRODUCT** (beta) | Removed. Concurrent first loads may create an extra empty visitor; harmless and bounded by the provisioning cap (§4.5). |
+| 210-day orphan retention and scheduled maintenance | **SIMPLIFY FOR BETA** | No scheduler. A documented operator cleanup query, run manually, with the same "never delete a visitor holding a valid session" rule (§9.3). |
+| Two `NOLOGIN` owner roles | **SIMPLIFY FOR BETA** | One owner role, `sovereign_owner` (§7.2). Retention runs as an operator task, not through a maintenance role. |
+| Database-enforced HMAC network rate limiting with key versioning | **SIMPLIFY FOR BETA** | Per-network limit kept as a capability (single HMAC key, no versioning) but **active only once a trusted client-IP source is verified** (§6.3). Global caps carry the mandatory protection. |
+| Trusted proxy and IP canonicalisation | **SIMPLIFY FOR BETA** | Same rules, applied only if per-network limiting is enabled; otherwise no forwarding header is read at all (§6.3). |
+| PostgreSQL driver and pooler | **REQUIRED BEFORE PUBLIC LAUNCH** | No secure alternative without `service_role`/`postgres` access; driver choice and pooler mode remain unapproved prerequisites (§11). |
+| Maintenance scheduling | **DEFER UNTIL VALIDATED** | Manual operator cleanup during the beta (§9.3). |
+| Development-only cleanup role, marker table, policies | **SIMPLIFY FOR BETA** | Marker table and expected-ref check kept; dedicated role and policies removed (§12.5). |
+| Data API configuration | **NOT REQUIRED FOR THIS PRODUCT** (beta) | Unused; `sovereign`/`private` never exposed. Disabling it entirely is deferred (D18). |
+| Username uniqueness, editing, `update_username`, username rate limit | **DEFER UNTIL VALIDATED** | Generated display username only (§4.2). |
+| "Start a new workspace" and "Forget this browser" | **SIMPLIFY FOR BETA** | Kept as two small actions without the nonce flow (§4.6). |
+| pgmq queue, Realtime Broadcast, budget reservation ledger, tool-calling loop, Forge, Convergence (from ARCHITECTURE §F) | **DEFER UNTIL VALIDATED** | Not needed for single-agent Tasks with one bounded model call (§5.1). |
+| Wallet, signing, on-chain features | **NOT REQUIRED FOR THIS PRODUCT** | Excluded (§1.1). |
+
+---
+
+## 4. Visitor identity (beta)
+
+### 4.1 Concepts
+| Concept | What it is | Secret? | Rule |
+|---|---|---|---|
+| Username | Generated display name, e.g. `quiet-heron-41` | No | Display only. Never authorises anything. |
+| Visitor id | `uuid` generated by PostgreSQL | No, **not a credential** | Never accepted from the client. |
+| Session token | 32 random bytes (`node:crypto`), base64url, 43 characters | **Yes** | Lives only in the cookie. |
+| Session token hash | SHA-256 of the token (32 bytes) | Sensitive | Stored in `visitor_sessions.token_hash`; never logged; not readable by `sovereign_app` or `sovereign_worker`. |
+| Task id | `uuid` | No, **not a credential** | Access to a Task always requires the owning session (§5.8). |
+
+Logs may contain visitor ids, workspace ids and Task ids. They never contain tokens, token hashes, cookie values, IP addresses or raw provider errors.
+
+### 4.2 Username
+- Generated server-side (`adjective-noun-NN`, `node:crypto` randomness), format `^[a-z0-9][a-z0-9_-]{2,23}$` checked in the server and by a database `CHECK`.
+- Not unique (no public profiles in the beta, so no lookup by name). Not editable in the beta (D4, D23).
+
+### 4.3 Cookie
+| Attribute | Value |
 |---|---|
-| Reload, new tab, browser restart (same profile) | Same visitor and workspace. |
-| Private/incognito window | A separate visitor, lost when the private session ends. |
-| Another browser, profile or device | A different visitor. **Cross-device recovery is out of scope.** |
-| Visitor clears cookies or site data | The old workspace becomes inaccessible from this browser. The old data is deleted later by retention cleanup (§6.8). |
-| No use for longer than the idle lifetime (§5.4) | Same as clearing cookies. |
-| Session revoked (§5.8) | Inaccessible from that browser. |
-| Cookie stolen | The thief can act as the visitor (§5.13). |
+| Name | `__Host-sovereign_session` in production; `sovereign_session` only on `http://localhost` |
+| `HttpOnly` | yes |
+| `Secure` | yes (off only on `http://localhost`) |
+| `SameSite` | `Lax` (sent on top-level navigations from other sites, withheld on cross-site `POST`; `Strict` would make visitors arriving from links look new) |
+| `Path` / `Domain` | `/` / not set (required by `__Host-`) |
+| `Max-Age` | equal to the session's remaining lifetime; re-set on renewal |
 
-### 2.6 Invalid, expired or revoked cookie
-- The server never deletes or overwrites a session cookie because it failed to validate. Only the explicit visitor actions "Start a new workspace" (§7.6) and "Forget this browser" (§5.8), and successful renewal or rotation (§5.4, §5.5), change it.
-- If a session cookie **was sent** but does not resolve to a visitor (any state other than `active` or `rotated_grace`, §5.6), the app area shows a notice ("This browser's previous Sovereign workspace can no longer be opened") and an explicit "Start a new workspace" action. No visitor is provisioned automatically while that cookie is present.
-- If **no** session cookie was sent, provisioning is automatic (§2.1).
-- Reason: with `SameSite=Lax` (§5.3) the cookie is sent on same-site requests and top-level navigations, so "no cookie" means "none stored". Replacing an unreadable cookie automatically would hide a real loss and could replace a newer cookie that an older in-flight response failed to validate (§5.5).
+### 4.4 Lifetime, renewal and states
+- **Idle lifetime** (`SOVEREIGN_SESSION_IDLE_DAYS`, proposed **90 days**): `expires_at = now() + lifetime` at issue.
+- **Renewal:** when a session is used and `now() - last_renewed_at >= 24 hours`, a **Server Action** extends `expires_at` and re-sets the cookie with a matching `Max-Age`. Page renders never renew, so the database expiry and the cookie cannot drift apart. No absolute cap.
+- **States** of a presented token at transaction time `now()` (returned by `resolve_session`, §7.4):
 
-### 2.7 Out of scope (explicit)
-Cross-device recovery, account linking, identity export/import, email, passwords, magic links, OAuth, recovery codes.
-
----
-
-## 3. Identity concepts
-
-| Concept | What it is | Where it lives | Secret? | Used for |
-|---|---|---|---|---|
-| **Username** | Human-readable display identity, e.g. `quiet-heron-41` | `sovereign.visitors.username` | No | Display only. Never authorises anything. |
-| **Visitor id** | `uuid` generated by PostgreSQL | `sovereign.visitors.id` | Not secret, **not a credential** | Internal key. Never accepted from the client for any decision. |
-| **Session token** | 256-bit random bearer token | Browser cookie only; never stored in plaintext server-side | **Yes** | Proof of possession of a session. |
-| **Session token hash** | SHA-256 of the token (32 bytes) | `sovereign.visitor_sessions.token_hash` | Sensitive (lookup key) | Session lookup and the database visitor context. Never logged; not readable by `sovereign_app` or the maintenance owner. |
-| **Session id** | `uuid` of a `visitor_sessions` row | Database; returned only for reuse and lineage events | Not secret, **not a credential** | Correlating server logs with recorded events. |
-| **Provisioning nonce** | 256-bit random value, ≤ 10-minute life | Browser cookie only; its SHA-256 in `sovereign.provisioning_nonces` | **Yes**, short-lived | De-duplicating provisioning requests that carry the same nonce (§5.10). |
-| **Network subject** | Key-version byte + HMAC-SHA-256 of the trusted client network (33 bytes) | Rate-limit counters only | Not reversible without the server key | Per-network provisioning limits (§5.11). |
-
-Rules:
-- No request parameter, form field or header carries a visitor id or workspace id that the server trusts. The server derives both from the session.
-- Visitor ids and session ids may appear in server logs. Tokens, nonces, their hashes, cookie values, IP addresses and network subjects never do.
-
----
-
-## 4. Visitor identity model
-
-### 4.1 Visitor id
-Generated by `gen_random_uuid()` inside the provisioning function. The client never proposes it.
-
-### 4.2 Initial username (D3–D5, recommended)
-- Generated server-side from a fixed word list plus a random number (`adjective-noun-NN`) using `node:crypto` randomness.
-- Format: 3–24 characters, lowercase `a–z`, digits, `-`, `_`, starting with a letter or digit; enforced by a database `CHECK`, by the database functions and by server-side validation before the database call.
-- Uniqueness: `UNIQUE`; the lowercase-only format makes it case-insensitive. On a collision the server retries the provisioning call with a new name, at most 5 times, then returns a generic error. Each attempt counts against the rate limits (§5.11).
-- Reserved names: a denylist (`admin`, `sovereign`, `support`, `system`, Order and goddess names, and the test prefix `zz-test-`) checked server-side. Server Actions and the generator never produce or accept the test prefix; only test fixtures use it (§9.7).
-
----
-
-## 5. Visitor session security
-
-### 5.1 Token
-- 32 bytes from `node:crypto`, encoded base64url (43 characters, no padding).
-- Only `sha256(token)` is stored and compared. A fast hash is appropriate because the token is high-entropy random data, not a password.
-- The raw token never reaches the database, logs, analytics or error reports. The database visitor context uses the hash (§6.5).
-
-### 5.2 Cookies
-| Attribute | Session cookie | Provisioning-nonce cookie |
+| State | Condition | Result |
 |---|---|---|
-| Name (production) | `__Host-sovereign_session` | `__Host-sovereign_provision` |
-| Name (`http://localhost` development only) | `sovereign_session` | `sovereign_provision` |
-| `HttpOnly` | yes | yes |
-| `Secure` | yes (off only on `http://localhost`) | yes (same) |
-| `SameSite` | `Lax` | `Lax` |
-| `Path` | `/` (required by `__Host-`) | `/` |
-| `Domain` | not set | not set |
-| `Max-Age` | synchronised with `expires_at` on every issue or refresh (§5.4) | 600 seconds |
+| `invalid_input` | cookie value not 43 base64url characters (checked before any database call), or hash not 32 bytes | no visitor |
+| `unknown` | no row with this hash | no visitor |
+| `revoked` | `revoked_at is not null` | no visitor |
+| `expired` | `now() >= expires_at` (strict boundary) | no visitor |
+| `active` | otherwise | visitor id, workspace id, `renewal_due` |
 
-### 5.3 SameSite choice
-- `Lax`: sent on same-site requests and on top-level cross-site `GET` navigations; withheld on cross-site `POST`, iframes and subresources.
-- `Strict` was rejected: a visitor arriving from an external link would arrive without the cookie and look like a new visitor.
-- `SameSite` is not the CSRF defence by itself (§5.9).
+- `current_visitor_id()` (§7.6) accepts exactly the `active` sessions, so render-time validation and the database context agree.
 
-### 5.4 Lifetime and renewal (D8)
-- **Idle lifetime: 180 days.** A session's `expires_at` is set to `now() + 180 days` when it is issued.
-- **Renewal** extends `expires_at` to `now() + 180 days` and sets `last_renewed_at = now()`. It happens only:
-  - for a session in state `active` (§5.6) — never for a rotated predecessor or any other state;
-  - when `now() - last_renewed_at >= 24 hours`;
-  - in the **refresh request** (§7.2), which also re-issues the cookie with a matching `Max-Age`. Render-time validation never renews, so the database expiry and the cookie expiry cannot drift apart.
-- **No absolute cap.** An absolute cap would destroy the workspaces of active visitors, because there is no recovery. Browsers may cap cookie lifetime (e.g. Chrome at 400 days); renewal keeps active visitors far inside that.
-- Inactivity longer than 180 days means permanent loss of access (§2.5).
+### 4.5 First visit (provisioning)
+1. A `GET` to the application area (M2: `/workspace`) without a session cookie renders the app shell with no visitor. **No `GET` creates database rows.**
+2. A client component sends one same-origin `POST` (`provisionVisitor` Server Action) automatically; no form, no click.
+3. The action runs the CSRF checks (§4.7), refuses if a session cookie is present (returns `reload`), generates the token and username, and calls `provision_visitor(token_hash, username, net_subject)`. The function applies the provisioning limits (§6.2) and creates visitor, workspace and session in one transaction.
+4. The response sets the session cookie and returns the workspace view.
 
-### 5.5 Session origins, first use and rotation (D10)
-Every session row has an immutable `origin`:
+Concurrency: two tabs loading at the same moment may create two visitors. The browser keeps the cookie that arrives last; both tabs then use it. The other visitor has no Tasks and is removed by operator cleanup (§9.3). This is accepted for the beta; it costs one counted provisioning attempt and two small rows.
 
-| `origin` | Created by | `predecessor_id` at creation |
-|---|---|---|
-| `provisioning` (an **initial session**) | `provision_visitor` (`created` or `joined`) | always `null` |
-| `rotation` (a **successor**) | `rotate_session` | always set, to a session of the **same visitor** (composite foreign key, §6.3) |
+### 4.6 Invalid cookie, "Start a new workspace" and "Forget this browser"
+- The server **never** deletes or replaces a session cookie because it failed to validate.
+- A cookie in state `unknown`, `revoked`, `expired` or `invalid_input` shows a notice ("This browser's previous Sovereign workspace can no longer be opened") with a **"Start a new workspace"** button. Its Server Action re-checks the cookie: if it is now `active`, nothing is deleted and the page reloads; otherwise the response deletes the cookie and the client reloads, which leads to normal provisioning (§4.5). If cookies are blocked, the client reloads once and then shows "Cookies are required".
+- **"Forget this browser"** (in the workspace, after a warning that access ends permanently) calls `revoke_session` and deletes the cookie.
+- **Operator revocation:** `update sovereign.visitor_sessions set revoked_at = now(), revoke_reason = 'operator'` by an operator in SQL (§9.2).
 
-`touch_session` chooses the first-use path from `origin`, never from whether `predecessor_id` happens to be null (a predecessor row can be deleted by retention, §6.8).
-
-**Initial-session first use** (`origin = 'provisioning'`, `first_used_at is null`, otherwise `active`):
-- Locks only its own row and sets its own `first_used_at = now()`.
-- Never reads, locks or updates any other session, and never sets `rotated_at`, `successor_id` or any other rotation field.
-- Concurrent first uses: the second one, after taking the row lock, finds `first_used_at` already set and writes nothing further.
-
-**Rotation:**
-- **When:** a session in state `active` whose token was issued 30 or more days ago (`now() - created_at >= 30 days`), during a refresh request (§7.2). Initial sessions and successors qualify the same way.
-- **Issue step** (`rotate_session`): locks the presented session (the predecessor) `FOR UPDATE`; it must be `active`. Inserts a successor (`origin = 'rotation'`, same visitor, `predecessor_id` = predecessor, fresh `created_at`, `last_renewed_at` and `expires_at = now() + 180 days`, `first_used_at = null`). The predecessor is **not changed**: it stays `active`. The response sets the new cookie.
-- **At most one recent pending successor:** if the predecessor already has an unrevoked successor with `first_used_at is null` created less than 10 minutes ago, `rotate_session` issues nothing and returns `pending` (no cookie). An older pending successor is presumed lost: it is revoked (`superseded`) and a new one is issued.
-
-**Successor first use** (`origin = 'rotation'`, `first_used_at is null`, not revoked, not expired):
-1. Read the successor's `predecessor_id` without locking. If it is null → state `invalid_lineage`.
-2. Lock the **predecessor first**, then the successor (`FOR UPDATE`), and re-read both.
-3. Lineage checks, all required; any failure → state `invalid_lineage` (no visitor, no change to either session, one event recorded, §5.6):
-   - the predecessor row still exists (it belongs to the same visitor by the composite key);
-   - the predecessor is not revoked;
-   - the predecessor's `successor_id` is null or already equals this successor;
-   - the successor is still unrevoked.
-4. If the successor's `first_used_at` was set by a concurrent transaction while waiting for the locks: treat it as an ordinary `active` session; no further writes.
-5. Otherwise complete: successor `first_used_at = now()`; predecessor `rotated_at = now()`, `successor_id` = this successor, `expires_at = least(expires_at, now() + interval '120 seconds')`; every other unrevoked pending successor of that predecessor is revoked (`superseded`).
-
-- **Grace period:** 120 seconds, **measured from `rotated_at`** (the completion timestamp), capped by the predecessor's previous expiry. A lost rotation response therefore does not start the clock: the browser still holds the predecessor, which stays `active`.
-- **Boundary:** a rotated predecessor is valid while `now() < expires_at` (strict). `now()` is the PostgreSQL transaction timestamp of the validating transaction; all comparisons in §5.6 and §6.5 use it.
-- **Determinism under concurrency:** every rotation and successor-first-use path locks the predecessor before the successor. Two concurrent first uses of one successor serialise on the predecessor lock and exactly one completes the rotation. Two different pending successors of one predecessor cannot both complete: the second finds `successor_id` pointing at the first (lineage check fails) and has already been revoked as `superseded`.
-
-### 5.6 Session states and `touch_session()` behaviour
-State of a presented token hash at transaction time `now()`, evaluated in this order:
-
-| # | State | Condition | Returned to `sovereign_app` | Writes |
-|---|---|---|---|---|
-| 1 | `invalid_input` | hash is not exactly 32 bytes | state | none |
-| 2 | `unknown` | no row with this hash (never issued, or deleted by retention, §6.8) | state | none |
-| 3 | `revoked` | `revoked_at is not null` | state | none |
-| 4 | `rotated_grace` | `rotated_at is not null` and `now() < expires_at` | state, visitor id; `renewal_due = false`, `rotation_due = false` | none |
-| 5 | `rotated_reused` | `rotated_at is not null` and `now() >= expires_at` | state, **session id** | `reuse_count + 1`, `last_reuse_at = now()`, one `session_events` row (`rotated_reuse`) |
-| 6 | `expired` | `now() >= expires_at` | state | none |
-| 7 | `invalid_lineage` | `origin = 'rotation'`, `first_used_at is null`, and a §5.5 lineage check fails | state, **session id** | one `session_events` row (`invalid_lineage`); no change to any session |
-| 8 | `active` | otherwise | state, visitor id, `expires_at`, `renewal_due`, `rotation_due` | initial or successor first use (§5.5) if `first_used_at is null`; renewal (§5.4) only with `renew = true` and due; `visitors.last_seen_at = now()` together with renewal |
-
-- A visitor id is returned **only** for `active` and `rotated_grace`.
-- `private.current_visitor_id()` (§6.5) accepts exactly: `revoked_at is null`, `now() < expires_at`, and (`origin = 'provisioning'` or `first_used_at is not null`). So it resolves `active` and `rotated_grace` sessions and initial sessions before their first use, and **never** a pending successor until `touch_session` has completed it. The request path always calls `touch_session` first (§5.7), so a valid successor is completed before its first data transaction.
-- A pending successor revoked as `superseded` is `revoked`.
-- `renewal_due = (now() - last_renewed_at >= 24 hours)`; `rotation_due = (now() - created_at >= 30 days)`; both only for `active`.
-
-**Reuse and lineage events (D22):**
-- Recorded **inside** `touch_session`, in the same transaction, in `private.session_events (occurred_at, event, session_id, visitor_id)` (§6.3). The table is insertable only by the function owner and readable by no application role. It never holds tokens, hashes or cookie values.
-- `touch_session` returns only the **session id** for these states — never the visitor id. The server logs `{state, session_id}` and nothing else from them.
-- **Failure behaviour:** if the event insert fails, the whole `touch_session` call fails (and its `reuse_count` update rolls back); the server treats any database error as `unavailable` and serves "no visitor". If the server's own log write fails, the error is swallowed after the result is decided. The result for these states is always "no visitor", so no logging failure can make a reused or inconsistent token valid.
-- Reuse detection is possible only while the rotated row is retained (30 days after its validity ends, §6.8); afterwards the token is `unknown`.
-- Reuse does not revoke the visitor's other sessions: without recovery, automatic visitor-wide revocation would end the legitimate visitor's access too (D10). The request gets "no visitor" and its response does not touch the cookie (§2.6).
-
-**Rotation races (multiple requests presenting the old token):**
-- Two refresh requests with the predecessor both see `rotation_due`. The first `rotate_session` issues successor S1 (`issued`, sets cookie); the second sees S1 pending and younger than 10 minutes (`pending`, no cookie). The browser ends with S1.
-- Requests in flight with the predecessor after the browser received S1: the predecessor is `active` until S1's first use, then `rotated_grace` for 120 s; they succeed. Afterwards they are `rotated_reused`: recorded, "no visitor", cookie untouched, while the browser keeps S1.
-- S1's response is lost: S1 is never used, the predecessor stays `active`, and the next refresh after 10 minutes supersedes S1 and issues S2.
-
-### 5.7 Server-side validation path
-1. Read the session cookie. Absent → "no visitor". Present but not 43 base64url characters → `invalid_input` without a database call.
-2. Hash it and call `private.touch_session(hash, renew)` (§6.6), with `renew = false` on the render path and `true` only in the refresh request (§7.2).
-3. Data access runs inside a separate transaction with the visitor context set from the same hash (§6.5). If the session became invalid between the two transactions (for example, grace ended), the context resolves to no visitor and the request fails closed.
-
-### 5.8 Revocation
-- **Per browser:** "Forget this browser" calls `revoke_session`, which revokes the presented session and every unrevoked pending successor of it (`revoke_reason = 'forgotten'`); the response then deletes the cookie. The visitor is warned first that access to the workspace ends permanently (D7).
-- **Operator:** revocation with `revoke_reason = 'operator'` by an operator in SQL; no admin UI in M2.
-- **Superseded:** pending successors replaced during rotation (§5.5).
-
-### 5.9 CSRF and Origin validation
-Every state-changing request (Server Actions and Route Handlers, `POST` only) passes all of these before any work:
-1. `Origin` is **required** and must equal the canonical origin (`SOVEREIGN_SITE_URL`, validated by `apps/web/src/lib/site-origin.ts`). A missing `Origin` is rejected. Next.js 16's built-in Server Action check compares `Origin` with `Host`/`X-Forwarded-Host` and lets a request without `Origin` through with a warning (bundled Next.js docs, `serverActions.md`); it is kept but not relied on.
+### 4.7 CSRF and Origin checks (every state-changing request)
+1. `Origin` is **required** and must equal the canonical origin (`SOVEREIGN_SITE_URL`, validated by `apps/web/src/lib/site-origin.ts`); a missing `Origin` is rejected. Next.js 16's own Server Action check lets a request without `Origin` through with a warning (bundled Next.js docs, `serverActions.md`), so it is not relied on.
 2. `Sec-Fetch-Site`, when present, must be `same-origin`.
-3. Session and nonce cookies are `SameSite=Lax`.
-A synchronizer CSRF token is deferred (D12).
+3. All state changes are `POST` Server Actions; the cookie is `SameSite=Lax`.
+CSRF protection does not limit abuse; §6 is separate and also required.
 
-**CSRF protection is not abuse protection.** Origin checks stop other sites from making a visitor's browser act; they do nothing against a script that sends same-origin-looking requests directly. Abuse controls (§5.11) are separate and both are required.
-
-### 5.10 Provisioning idempotency (D21)
-**Guaranteed:** idempotency **per provisioning nonce**. Every provisioning request carrying the same nonce resolves to the same visitor, within the nonce's limits (10 minutes from its first database use, at most 5 sessions) and subject to the outcomes below. **Not guaranteed:** one visitor per browser. Requests carrying different nonces create different visitors. No client-supplied visitor id is used, and no long-lived client credential is introduced.
-
-- **Nonce issue:** a `GET` to an app path whose request has **neither** a session cookie **nor** a nonce cookie receives `__Host-sovereign_provision` = 32 random bytes (base64url), `Max-Age=600`. Cookie write only; no database access (D19).
-- **Provisioning requires the nonce.** A provisioning `POST` without a nonce cookie returns `reload`.
-- **Database de-duplication** (`provision_visitor`, §6.6, one transaction, after the limits in §5.11):
-  1. `insert into sovereign.provisioning_nonces (nonce_hash, created_at) values ($1, now()) on conflict do nothing`.
-  2. Inserted: create visitor, workspace and initial session; set the nonce row's `visitor_id`; `mint_count = 1`; outcome `created`.
-  3. Row already existed: lock it `FOR UPDATE`. If `now() >= created_at + 10 minutes` or `mint_count >= 5` → outcome `provisioning_expired`. Otherwise create a new initial session for the row's visitor, increment `mint_count`, outcome `joined`.
-  A concurrent transaction with the same nonce blocks on the primary key until the first commits, then follows step 3; if the first rolls back, it performs step 2.
-- **Success response** sets the session cookie and deletes the nonce cookie.
-
-| Scenario | Result |
-|---|---|
-| Same nonce, concurrent requests | One visitor (`created` once, `joined` for the rest, up to 5 sessions, then `provisioning_expired`). |
-| Same nonce, retried or duplicated Server Action | Same visitor (`joined`). |
-| Refresh during provisioning | The nonce cookie survives → same nonce → same visitor. |
-| Request sent before another tab's response set the session cookie | Same nonce → same visitor. |
-| A tab's `POST` already carries a session cookie | `reload` (no database write); the tab then renders with that session. |
-| Several tabs load at almost the same moment and their `GET` responses interleave | The tabs may hold **different** nonces when their `POST`s leave → **different visitors**. The browser keeps whichever session cookie arrives last; the other visitors become orphans (§6.8). |
-| Different browser profiles or devices | Different nonces → different visitors (intended). |
-| Nonce older than 10 minutes or mint limit reached | `provisioning_expired` → nonce cookie deleted, `reload` → a fresh nonce on the next `GET`. |
-| Cookies blocked | No nonce is stored → `reload` once, then a "cookies are required" notice (§7.6). |
-
-- **Mitigation, not guarantee:** the client component is single-flight per tab and may coordinate across tabs (for example with `BroadcastChannel`). This makes the interleaving case rarer; correctness does not depend on it.
-- **Orphans** are ordinary visitors whose sessions are never used again; §6.8 removes them like any abandoned visitor, and cleanup can never delete a visitor with a valid session.
-- **Nonce theft:** within its window and mint limit, a stolen nonce lets the thief obtain a session for that newly created visitor — the same power as stealing the session cookie at that moment.
-
-### 5.11 Abuse controls (D13, mandatory for public deployment)
-Public deployment is **not allowed** without these controls. They are enforced **inside the database functions** that perform the guarded action, backed by shared database state, so they hold across multiple application instances and cannot be skipped or redirected by the caller.
-
-| Control | Bucket | Canonical subject (enforced by `CHECK` and by the function) | Proposed default (D13 values) | On exceed |
-|---|---|---|---|---|
-| Provisioning per client network | `provision_net_hour`, `provision_net_day` | **Network subject**: exactly 33 bytes = 1 key-version byte + HMAC-SHA-256 (§5.12) | 10 per hour **and** 30 per day | outcome `rate_limited_network` → "Too many new workspaces from this network. Please try again later." |
-| Global provisioning circuit breaker | `provision_global_hour` | exactly the 1-byte value `\x00`, set inside the function, never passed by the caller | 1,000 per hour (operator-configurable) | outcome `rate_limited_global` → "Sovereign is temporarily unavailable. Please try again later." |
-| Username changes per visitor | `username_visitor_day` | exactly the 16-byte visitor id **from `current_visitor_id()`** of the calling transaction, never passed by the caller | 10 per day | outcome `rate_limited` → "Too many changes. Please try again tomorrow." |
-
-- **No caller-chosen subjects.** `sovereign_app` cannot write counters and has no generic rate-limit function. Limits are consumed by an internal helper (`private.consume_limit`, executable by nobody but its owner) called only from `provision_visitor` and `update_username`.
-- **Provisioning** (`provision_visitor(…, net_subject)`), inside the function before anything is created:
-  1. Validate `net_subject`: not null; exactly 33 bytes; version byte equal to `private.identity_settings.network_key_version`, **or** the development subject (version byte `0` followed by 32 zero bytes) **and** `identity_settings.allow_dev_network_key = true`. Anything else → outcome `config_mismatch` (generic "temporarily unavailable"); nothing consumed, nothing created.
-  2. Consume `provision_net_hour` and `provision_net_day` for that subject; if either is exceeded → `rate_limited_network`.
-  3. Consume `provision_global_hour` with the fixed subject; if exceeded → `rate_limited_global`.
-  4. Only then run §5.10's nonce logic. Counters consumed in steps 2–3 are committed even when the outcome is a limit (attempts count).
-- **Why the limits cannot be evaded by varying the subject:** the network subject is computed by the server from the trusted client address (§5.12). The database cannot verify an HMAC whose key it does not hold, so a compromised or buggy server could vary the network subject and escape the **per-network** limit. It cannot escape the **global** limit: every attempt that passes step 2 consumes the fixed global subject in step 3. And without a valid network subject there is no provisioning at all (step 1), so omitting network identity cannot bypass the global breaker either. The username limit's subject comes from the transaction context, not from any argument.
-- **Username changes** (`update_username(new_username)`): validate the format and denylist first (invalid → `invalid`, nothing consumed); resolve the visitor from `current_visitor_id()` (none → `no_visitor`, nothing consumed); consume `username_visitor_day` for that visitor id (exceeded → `rate_limited`); then update. A unique violation returns `taken` and still counts.
-- **Key and version handling:** the HMAC key (`SOVEREIGN_RATE_LIMIT_KEY`, ≥ 32 random bytes, server-only) and its version (`SOVEREIGN_RATE_LIMIT_KEY_VERSION`, 1–255) are configured on the server; `identity_settings.network_key_version` must hold the same version. Rotating the key means changing both together; per-network windows effectively restart after a rotation (accepted). A version mismatch fails closed (`config_mismatch`). Variable names are proposed.
-- **Development subject:** accepted only where `allow_dev_network_key` is true (development databases). The column defaults to false; production rejects the subject.
-- **Storage and bounds:** `private.rate_limit_counters` (fixed windows aligned to the database clock) and `private.rate_limit_settings`; atomic `insert … on conflict … do update`. A missing settings row denies. Rows older than 2 days are deleted by maintenance (§6.8). The per-network check runs before the global one so that one network cannot exhaust everyone's allowance; as a result each attempt from a new network creates counter rows, and very-many-address volumetric attacks are bounded only by request volume. Platform-level protection (WAF/edge rate limiting) is a deployment prerequisite for that class of attack.
-- **Responses and logs** never reveal counts, windows, subjects, infrastructure or which internal check failed beyond the generic messages above. Logs record outcome names only.
-- **Trade-off (approval needed):** visitors behind shared addresses (carrier-grade NAT, offices, schools) share the per-network limit.
-
-### 5.12 Client IP trust (D14, unresolved deployment prerequisite)
-- Next.js request handlers do not provide a trustworthy peer address on their own, and every `X-Forwarded-*`, `Forwarded` or `X-Real-IP` header can be sent by any client. **No forwarding header is trusted by default.**
-- A header is trusted only when **all** of these are true and configured explicitly:
-  1. The deployment's reverse proxy or platform is selected and documented.
-  2. The application is reachable **only** through that proxy (no direct public path that bypasses it).
-  3. The proxy **overwrites** (does not append to) one named header with the connecting client's address.
-  4. The server is configured with that exact header name (proposed variable `SOVEREIGN_CLIENT_IP_HEADER`), and the value parses as exactly one IPv4 or IPv6 address. Lists, ports, empty values and anything else are "untrusted".
-- **Canonical network:** an IPv4 address as its 4 bytes; an IPv6 address reduced to its /64 prefix (8 bytes); IPv4-mapped IPv6 treated as IPv4. Network subject = `version byte || HMAC-SHA-256(key, family byte || canonical bytes)`.
-- The proxy/provider is **not yet selected**, so no header is named in this specification.
-- **Fail-closed behaviour:** in production (canonical origin not loopback), if no trusted client address can be established, the server does not call `provision_visitor` and returns the generic "temporarily unavailable" message; a configuration error is logged without header values. Requests from existing visitors are unaffected. Username changes do not need the client address.
-- **Local development** (`SOVEREIGN_SITE_URL` on a loopback host): the server sends the development subject. This branch never activates for a non-loopback origin, and the database accepts that subject only where `allow_dev_network_key` is true.
-
-### 5.13 Theft and loss
-- **Theft:** the session cookie is a bearer credential. Whoever presents it **is** the visitor: they can read and change everything the visitor can. HttpOnly prevents scripts reading it, but XSS can act within the page, and malware or a copied browser profile can take the cookie. There is no second factor and no way for the real visitor to end the thief's access from another device. Rotation (§5.5) limits the life of a copied token that is **not** used; a thief who uses the token can perform rotation themselves and the legitimate browser's token then becomes `rotated_reused` (recorded, §5.6) — the visitor loses access, which is detectable but not recoverable.
-- **Loss:** clearing cookies, losing the profile or device, or inactivity beyond 180 days loses access permanently. This is accepted (product requirement).
+### 4.8 Security trade-offs of the simplified identity
+- **Theft:** the cookie is a bearer credential. Whoever holds it **is** that visitor until the session expires or is revoked: they can read the visitor's Tasks and results and submit Tasks against the visitor's limits. Without rotation (deferred), a copied cookie stays valid as long as the original. HttpOnly stops scripts reading it; XSS can still act inside the page, and malware or a copied browser profile can take it. There is no second factor and no way for the visitor to end the thief's access from another device. The real visitor can end it by "Forget this browser" (which also ends their own access) or by asking the operator, who has no way to verify who is asking.
+- **Expiry:** after 90 days without use (proposed), access is lost permanently.
+- **Loss:** clearing cookies or site data, deleting the profile or losing the device loses access permanently. Accepted by the client.
+- **What is protected:** Task inputs and outputs of other visitors. The beta does not hold payment data, wallets or personal account data; it does hold whatever visitors type into Tasks (§9.4 privacy notice).
 
 ---
 
-## 6. Database model and Supabase security
+## 5. Agent execution (primary concern)
 
-### 6.1 Placement
-- Supabase PostgreSQL remains the hosted database.
-- Identity tables live in the schema `sovereign`, which is **not** exposed through the Supabase Data API (D2). Settings, rate-limit and event tables and all functions live in `private` (not exposed).
-- No `profiles`, no `workspace_members`, no `workspace_data` JSONB placeholder. Domain tables arrive with their requirements, each with `workspace_id` and the same RLS pattern.
+### 5.1 Evidence: what exists, what M2 provides, what is deferred
+| Capability | Already in the project | M2 beta must provide | Deferred |
+|---|---|---|---|
+| Agent catalogue | Demo-only data in `apps/web/src/demo/data.ts` (5 Orders, 20 fictional agents, no instructions); design for agents/versions/Forge in ARCHITECTURE §F, DATA-MODEL §G | A small **platform-defined catalogue** of real agents with instructions (§5.2) | Visitor-created agents (Forge, M4), publishing, Codex |
+| Task submission | Design only: decree → `public.issue_decree` RPC (§F.8) | `submit_task` with validation, limits and idempotency (§5.4) | Priorities, deadlines, multi-agent Tasks |
+| Durable execution state | Design only: `agent_runs` with fenced lease (§F.8) | `sovereign.tasks` row as the single source of truth with a lease (§5.5) | Separate quests / runs / steps tables |
+| Queue | Design only: pgmq (`[VERIFY AT M2]`) | **No queue extension**: the worker claims from `tasks` with `FOR UPDATE SKIP LOCKED` (the alternative already evaluated in §F.8) | pgmq, if volume or retry patterns require it |
+| Worker | `apps/worker` has a configuration/health startup check only ("the queue loop arrives at M5", ARCHITECTURE §H.1 note) | A claim–execute–complete loop (§5.5–§5.6) | Heartbeats for long multi-step runs |
+| Model provider | Design: own `ModelProvider` interface, first adapter Anthropic (ADR-0001, §F.1) | One adapter, one call per attempt, hard token and time caps (§5.6) | Second provider, streaming tokens |
+| Tools (`web_search`, `web_fetch`, …) | Design only (§F.5, §F.10) | **None in the first beta** unless the client decides otherwise (D27) | Tools, tool idempotency, SSRF guard |
+| Budget | Design: reservation/settlement ledger (§F.9, M4b) | Simpler bounded-cost controls (§6) | Reservation ledger, per-workspace monetary budgets |
+| Status updates | Design: private Realtime Broadcast (§F.7) | **Polling** from the page (§5.9) | Realtime |
+| Results | Design: `deliverables` table | Output text stored on the Task (§5.7) | Versioned deliverables, approvals |
+| Approvals, Convergence, Guilds, Chronicle | Design only | — | All deferred |
 
-### 6.2 Roles (D15, D16, D20)
-| Role | Attributes | Purpose |
+### 5.2 Agents (D26)
+- The beta offers a **fixed list of platform-defined agents**, defined in server-side code (a typed catalogue module in `packages/core`, version-controlled) with: `agent_key`, `version`, display name, Order, short public description, **system instructions** (server-side only, never sent to the browser), model id, `max_output_tokens`, and whether it is enabled.
+- Which agents ship and their instructions are a **client decision** (D26). The demo's 20 agents are fictional placeholders and must not be shown as working agents unless they are given real instructions.
+- Each Task records the `agent_key` and `agent_version` it ran with, so outputs stay traceable when instructions change.
+
+### 5.3 Task lifecycle
+```
+              submit_task
+                  │
+                  ▼
+   ┌──────────► queued ──── cancel (visitor) ───────────► cancelled
+   │              │
+   │   claim (worker, SKIP LOCKED, new lease)
+   │              ▼
+   │           running ──── model call ok ─────────────► succeeded
+   │              │  └──── cancel requested, checked ──► cancelled
+   │              │  └──── terminal error / attempts exhausted / queue timeout ─► failed
+   │              │
+   └── retryable error or lease expired (attempts < max) ── back to queued (after backoff)
+```
+
+| Status | Meaning | Who sets it |
 |---|---|---|
-| `postgres` | Supabase-managed | Applies migrations; owns tables and schemas. Never used by the running application or by test cleanup. |
-| `sovereign_identity_owner` | `NOLOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOINHERIT` | Owns the request-path functions. Privileges in §6.6, owner-scoped policies in §6.7. |
-| `sovereign_maintenance_owner` | same attributes | Owns retention functions (§6.8). Column-level privileges only; cannot read token or nonce hashes. |
-| `sovereign_app` | `LOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOREPLICATION NOINHERIT`, `CONNECTION LIMIT` (D16) | The only role the web server uses. Password set **out of band**, never in a migration or the repository. |
-| `sovereign_test_cleanup` | `LOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOINHERIT`; **development databases only** | Test-data cleanup (§6.8). Created by a development-only setup script, never by a migration; does not exist in production. |
-| `anon`, `authenticated` | Supabase-managed | No privileges on `sovereign` or `private` objects. |
-| `service_role` | Supabase-managed; bypasses RLS | **Not used** by application runtime or by tests. |
+| `queued` | Accepted and durable; waiting for a worker | `submit_task`; worker on retry |
+| `running` | Claimed by a worker holding a valid lease | worker |
+| `succeeded` | Output stored | worker |
+| `failed` | Terminal; a sanitised `error_code` is stored | worker, or the queue-timeout sweep |
+| `cancelled` | Stopped at the visitor's request | `cancel_task` (queued) or worker (running) |
 
-### 6.3 Tables
+Terminal states (`succeeded`, `failed`, `cancelled`) never change again.
+
+### 5.4 Submission (`submitTask` Server Action → `submit_task` function)
+1. CSRF checks (§4.7); resolve the session (`active` required).
+2. Validate input with Zod in the server: `agent_key` exists and is enabled; Task text is non-empty, within `SOVEREIGN_TASK_INPUT_MAX_CHARS` (proposal: 4,000) and free of control characters other than newlines/tabs; an `idempotency_key` (UUID generated by the page per submission) is present.
+3. Inside `withVisitor` (§7.6), call `submit_task(agent_key, agent_version, input, idempotency_key)`. The function:
+   - derives the workspace from `current_visitor_id()` (never from an argument);
+   - checks the kill switch and global submission ceilings (§6.2);
+   - checks the visitor's limits: active Tasks (`queued` + `running`) and Tasks per day (§6.2);
+   - inserts the Task as `queued`, or returns the existing Task if `(workspace_id, idempotency_key)` already exists — a double click or retried request never creates a second Task or a second charge against the limits.
+4. Returns the Task id and status. Over-limit outcomes return generic messages (§6.4).
+
+### 5.5 Claim and lease (worker)
+- The worker polls (`SOVEREIGN_WORKER_POLL_MS`, proposal 1–2 s) and claims at most `SOVEREIGN_WORKER_CONCURRENCY` Tasks at once (proposal: 2):
+  ```sql
+  update sovereign.tasks t set status = 'running', attempts = attempts + 1,
+         lease_token = gen_random_uuid(), lease_expires_at = now() + :lease, started_at = coalesce(started_at, now())
+  where t.id = (select id from sovereign.tasks
+                where status = 'queued' and not_before <= now()
+                order by created_at for update skip locked limit 1)
+  returning t.id, t.lease_token, …;
+  ```
+  Before claiming, the worker checks the kill switch and the global usage ceilings (§6.2); when blocked it claims nothing.
+- **Lease** = model timeout + margin (proposal: 150 s for a 120 s call). A lease is needed because a worker can crash mid-call.
+- **Recovery:** a `running` Task whose lease has expired is returned to `queued` (if `attempts < max_attempts`) or set `failed` (`error_code = 'worker_lost'`) by a sweep the worker runs each poll cycle. This can cause a second model call for the same Task (at-least-once execution; cost bounded by `max_attempts`, §6.2).
+- **Fencing:** every completion update includes `where id = $1 and lease_token = $2 and status = 'running'`. A worker whose lease was taken over cannot overwrite the newer attempt.
+
+### 5.6 Execution (one bounded model call per attempt)
+- Build the request from the agent's system instructions and the visitor's Task text as the user message. The Task text is **data, not instructions to the platform**; agent instructions say so, but the system prompt is not treated as a security boundary (SECURITY §I.4). With no tools, a prompt injection can only influence the text of that visitor's own output.
+- Call the provider with `max_tokens = agent.max_output_tokens` (proposal: ≤ 2,048) and a request timeout (proposal: 120 s, matching §F.5).
+- Before the call and after it returns, check `cancel_requested`. If set after return, the output is discarded and the Task becomes `cancelled` (the call's cost has already been incurred).
+- Record `input_tokens`, `output_tokens` and the model id from the provider's usage data on the Task and in the daily usage counters (§6.2).
+
+### 5.7 Results, partial outputs and errors
+- **Success:** output text stored in `tasks.output` (capped at `SOVEREIGN_TASK_OUTPUT_MAX_CHARS`, proposal 40,000), `status = 'succeeded'`. If the provider stopped because of the token cap, `output_truncated = true` and the page says the answer was cut short.
+- **Refusals** by the model are stored as normal output; the page shows them as the agent's answer.
+- **Retryable errors** (provider rate limit, 5xx, timeout, connection loss): back to `queued` with `not_before = now() + backoff` (proposal: 30 s, then 2 min) while `attempts < max_attempts` (proposal: 2); then `failed`.
+- **Terminal errors** (request rejected as invalid, content filtered, configuration error): `failed` immediately.
+- **Queue timeout:** a Task still `queued` after `SOVEREIGN_TASK_QUEUE_TIMEOUT_MIN` (proposal: 15 min) becomes `failed` (`error_code = 'queue_timeout'`), so visitors do not receive answers long after leaving.
+- **Stored error data:** only an `error_code` from a fixed list (`provider_unavailable`, `rate_limited`, `timeout`, `rejected`, `worker_lost`, `queue_timeout`, `capacity`, `internal`). Raw provider messages go to server logs only (sanitised), never to the visitor or the database.
+- **Display:** output is rendered as markdown through an allowlist sanitiser (no raw HTML, no `javascript:` links; SECURITY §I.4, LLM05). Failed Tasks show a plain message and a "Submit again" button that creates a **new** Task.
+
+### 5.8 Isolation between visitors
+- Every Task belongs to exactly one workspace (`tasks.workspace_id`, foreign key, not null).
+- `sovereign_app` can read Tasks only through RLS (`workspace of current_visitor_id()`), and cannot insert, update or delete Tasks directly. `submit_task` and `cancel_task` derive the workspace from the session context; a Task id or workspace id sent by the browser is used only as a lookup **within** that workspace.
+- A visitor cannot read, modify or cancel another visitor's Task: reads are filtered by RLS, `cancel_task(task_id)` updates only `where id = $1 and workspace_id = <context workspace>`, and a Task id from another workspace returns `not_found`, indistinguishable from a non-existent id.
+- The worker sees all Tasks (it must), but cannot read `visitors` or `visitor_sessions`.
+
+### 5.9 Status retrieval, closing the tab, reconnecting
+- The Task page polls a Server Action (`getTask`) every few seconds (proposal: 2 s while `queued`/`running`, backing off to 10 s; stops at a terminal status). No Realtime in the beta.
+- Execution does not depend on the browser: closing the tab, reloading or returning later does not affect a queued or running Task. On return the workspace lists the visitor's Tasks (most recent first, paginated) with status and output.
+- A visitor who has lost their session cannot see their old Tasks (§4.8).
+
+### 5.10 Cancellation
+- `queued` → `cancelled` immediately by `cancel_task`.
+- `running` → `cancel_task` sets `cancel_requested = true`; the worker finishes or abandons the current call and sets `cancelled` (§5.6).
+- Terminal Tasks cannot be cancelled (`not_cancellable`).
+
+---
+
+## 6. Abuse prevention and cost control
+
+### 6.1 Principles
+- Anonymous execution will be abused and costs the operator money. Every limit below is enforced **server-side in the database functions or the worker**, never in the browser.
+- All limits are **configuration values** (rows in `private.platform_settings`, §7.3, editable by an operator in SQL). The numbers marked "proposal" are starting points for the client to confirm after cost modelling; they are not evidence-based.
+- When a limit is reached, the system **refuses new work with a generic message** and never half-processes a Task.
+
+### 6.2 Limits
+| Control | Where enforced | Proposal | When reached |
+|---|---|---|---|
+| **Kill switch** `execution_enabled` | `submit_task`, worker claim | `false` until launch | Submissions refused ("Agents are paused"); worker claims nothing; running Tasks finish |
+| **Global daily Task ceiling** | `submit_task` | client to set from cost model | "Agents are busy today. Please try again tomorrow." |
+| **Global daily token ceiling** (input + output, from provider usage) | worker before claim | client to set from cost model | Worker stops claiming; queued Tasks wait, then hit queue timeout |
+| **Provider-side spend limit** | model provider account, if the provider offers one (to verify, §11) | set below the operator's tolerance | Provider rejects calls → Tasks fail `capacity` |
+| **Global provisioning ceiling** (new visitors per hour) | `provision_visitor` | 1,000 / hour | "Sovereign is busy. Please try again shortly." |
+| **Per-network provisioning limit** | `provision_visitor`, only when a trusted client IP is configured (§6.3) | 10 / hour and 30 / day | "Too many new workspaces from this network." |
+| **Per-visitor active Tasks** (`queued` + `running`) | `submit_task` | 1 | "Wait for your current Task to finish." |
+| **Per-visitor Tasks per day** | `submit_task` | 20 | "You've reached today's Task limit." |
+| **Input size** | Server Action (Zod) and `CHECK` | 4,000 characters | Validation message |
+| **Output size** | worker (`max_tokens`) and `CHECK` | 2,048 tokens / 40,000 characters | Truncation flag (§5.7) |
+| **Per-attempt timeout** | worker | 120 s | Retryable error |
+| **Attempts per Task** | worker | 2 | `failed` |
+| **Worker concurrency** | worker | 2 per process | Tasks wait in queue |
+| **Queue timeout** | worker sweep | 15 min | `failed` (`queue_timeout`) |
+| **Request body size** | Next.js Server Actions default 1 MB (bundled docs) | keep default | Request rejected |
+
+**Upper bound on cost:** per Task ≤ `max_attempts × (max input tokens × input price + max_output_tokens × output price)`; per day ≤ that × the global daily Task ceiling, and also ≤ the global token ceiling. Prices come from the provider's published pricing at the time of configuration; this document does not state them.
+
+**Why these are enough for the first exposure:** a bot can create many visitors, but every visitor shares the global Task and token ceilings, so total cost is bounded. What a bot can still do is **exhaust the daily ceilings** and deny service to real visitors for the rest of the day. Per-network limiting reduces that; it depends on §6.3.
+
+### 6.3 Client network identity (per-network limiting)
+- Next.js handlers do not provide a trustworthy client address by themselves, and `X-Forwarded-For`, `Forwarded`, `X-Real-IP` and similar headers can be sent by anyone. **No such header is read unless explicitly configured.**
+- A header may be trusted only if the hosting platform is selected and verified to (1) be the only public path to the app and (2) **overwrite** that header with the connecting address. Then `SOVEREIGN_CLIENT_IP_HEADER` names it, the value must parse as exactly one IP address, IPv6 is reduced to /64, and the server passes `HMAC-SHA-256(SOVEREIGN_RATE_LIMIT_KEY, network)` (32 bytes) to `provision_visitor`.
+- If no trusted source is configured, `net_subject` is `null`, the per-network limit is **off**, and only the global ceilings apply. This is a **client decision** for the first beta (D14); it must be resolved before increasing traffic (§10 B).
+- Raw IP addresses are never stored or logged.
+
+### 6.4 Responses
+Refusals use generic messages (above) and never reveal counts, thresholds, internal checks or infrastructure. Logs record the outcome name only.
+
+---
+
+## 7. Database model and roles
+
+### 7.1 Placement
+- Tables in schema `sovereign`; settings, counters and functions in `private`. Neither schema is exposed through the Supabase Data API; nothing Sovereign lives in `public`.
+- Supabase Auth is unused; sign-ups and anonymous sign-ins are disabled in the dashboard so no `auth.users` rows can be created with the publishable key.
+- No generic JSON storage tables; each table below serves a stated requirement.
+
+### 7.2 Roles
+| Role | Attributes | Used by | Purpose |
+|---|---|---|---|
+| `sovereign_app` | `LOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOINHERIT`, connection limit | web server | Reads own rows under RLS; calls the visitor functions. No table writes. |
+| `sovereign_worker` | same attributes | worker | Claims and completes Tasks; updates usage counters; reads settings. No access to `visitors` or `visitor_sessions`. |
+| `sovereign_owner` | `NOLOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOINHERIT` | nobody logs in | Owns the SECURITY DEFINER functions (§7.4); holds only the privileges they need, plus owner-scoped RLS policies. |
+| `postgres` | Supabase-managed | operators, migrations | Owns tables. **Never** used by the web server or worker at runtime. |
+| `anon`, `authenticated`, `service_role` | Supabase-managed | — | No privileges on `sovereign`/`private`. `service_role` is not used anywhere. |
+
+Passwords for the two login roles are set out of band by the operator and stored only in the hosting platform's secret settings.
+
+**Why one owner role instead of `postgres`:** a SECURITY DEFINER function runs with its owner's privileges. Owned by `postgres`, a bug in any function body could reach every object `postgres` can. Owned by `sovereign_owner`, it can reach only the table privileges listed in §7.4. Whether the hosted project lets `postgres` create this role and transfer function ownership is unverified (§11, P2); falling back to `postgres` ownership is weaker and needs explicit approval (D15).
+
+### 7.3 Tables (illustrative DDL for review, not a migration)
 
 ```sql
--- Illustrative DDL for review. Not a migration.
 create schema sovereign;
 
 create table sovereign.visitors (
   id            uuid primary key default gen_random_uuid(),
-  username      text not null unique
-                check (username ~ '^[a-z0-9][a-z0-9_-]{2,23}$'),
+  username      text not null check (username ~ '^[a-z0-9][a-z0-9_-]{2,23}$'),
   created_at    timestamptz not null default now(),
-  updated_at    timestamptz not null default now(),
   last_seen_at  timestamptz not null default now()
 );
 
 create table sovereign.workspaces (
   id          uuid primary key default gen_random_uuid(),
   visitor_id  uuid not null unique references sovereign.visitors (id) on delete cascade,
-  name        text not null default 'Personal workspace' check (char_length(name) between 1 and 80),
-  created_at  timestamptz not null default now(),
-  updated_at  timestamptz not null default now()
+  created_at  timestamptz not null default now()
 );
 
 create table sovereign.visitor_sessions (
   id               uuid primary key default gen_random_uuid(),
   visitor_id       uuid not null references sovereign.visitors (id) on delete cascade,
-  origin           text not null check (origin in ('provisioning', 'rotation')),
   token_hash       bytea not null unique check (octet_length(token_hash) = 32),
-  created_at       timestamptz not null default now(),          -- token issue time
-  first_used_at    timestamptz,                                 -- first successful validation
+  created_at       timestamptz not null default now(),
   last_renewed_at  timestamptz not null default now(),
-  expires_at       timestamptz not null,
-  predecessor_id   uuid,                                        -- set at insert for origin = 'rotation' only
-  rotated_at       timestamptz,                                 -- set on a predecessor at rotation completion
-  successor_id     uuid,
+  expires_at       timestamptz not null check (expires_at > created_at),
   revoked_at       timestamptz,
-  revoke_reason    text check (revoke_reason in ('forgotten', 'operator', 'superseded')),
-  reuse_count      integer not null default 0 check (reuse_count >= 0),
-  last_reuse_at    timestamptz,
-  unique (id, visitor_id),
-  foreign key (predecessor_id, visitor_id)
-    references sovereign.visitor_sessions (id, visitor_id) on delete set null (predecessor_id),
-  foreign key (successor_id, visitor_id)
-    references sovereign.visitor_sessions (id, visitor_id) on delete set null (successor_id),
-  check (origin = 'rotation' or predecessor_id is null),       -- an initial session never has a predecessor
-  check (predecessor_id is null or predecessor_id <> id),
-  check (successor_id is null or successor_id <> id),
-  check (expires_at > created_at),
-  check ((revoked_at is null) = (revoke_reason is null)),
-  check (successor_id is null or rotated_at is not null),
-  check ((reuse_count = 0) = (last_reuse_at is null)),
-  check (reuse_count = 0 or rotated_at is not null)
+  revoke_reason    text check (revoke_reason in ('forgotten', 'operator')),
+  check ((revoked_at is null) = (revoke_reason is null))
 );
-create index visitor_sessions_visitor_id_idx     on sovereign.visitor_sessions (visitor_id);
-create index visitor_sessions_predecessor_id_idx on sovereign.visitor_sessions (predecessor_id);
-create index visitor_sessions_expires_at_idx     on sovereign.visitor_sessions (expires_at);
+create index on sovereign.visitor_sessions (visitor_id);
 
-create table sovereign.provisioning_nonces (
-  nonce_hash  bytea primary key check (octet_length(nonce_hash) = 32),
-  visitor_id  uuid references sovereign.visitors (id) on delete cascade,  -- null only inside the creating transaction
-  created_at  timestamptz not null default now(),
-  mint_count  integer not null default 0 check (mint_count between 0 and 5)
+create table sovereign.tasks (
+  id                uuid primary key default gen_random_uuid(),
+  workspace_id      uuid not null references sovereign.workspaces (id) on delete cascade,
+  idempotency_key   uuid not null,
+  agent_key         text not null check (agent_key ~ '^[a-z0-9-]{1,40}$'),
+  agent_version     text not null check (char_length(agent_version) between 1 and 40),
+  input             text not null check (char_length(input) between 1 and 4000),
+  status            text not null default 'queued'
+                    check (status in ('queued', 'running', 'succeeded', 'failed', 'cancelled')),
+  attempts          integer not null default 0 check (attempts between 0 and 5),
+  not_before        timestamptz not null default now(),
+  cancel_requested  boolean not null default false,
+  lease_token       uuid,
+  lease_expires_at  timestamptz,
+  output            text check (output is null or char_length(output) <= 40000),
+  output_truncated  boolean not null default false,
+  error_code        text check (error_code in ('provider_unavailable', 'rate_limited', 'timeout', 'rejected',
+                                               'worker_lost', 'queue_timeout', 'capacity', 'internal')),
+  model             text,
+  input_tokens      integer check (input_tokens >= 0),
+  output_tokens     integer check (output_tokens >= 0),
+  created_at        timestamptz not null default now(),
+  started_at        timestamptz,
+  finished_at       timestamptz,
+  unique (workspace_id, idempotency_key),
+  check ((status = 'running') = (lease_token is not null and lease_expires_at is not null)),
+  check ((status = 'succeeded') = (output is not null)),
+  check ((status = 'failed') = (error_code is not null)),
+  check ((status in ('succeeded', 'failed', 'cancelled')) = (finished_at is not null))
 );
-create index provisioning_nonces_created_at_idx on sovereign.provisioning_nonces (created_at);
+create index tasks_claim_idx     on sovereign.tasks (created_at) where status = 'queued';
+create index tasks_workspace_idx on sovereign.tasks (workspace_id, created_at desc);
+create index tasks_lease_idx     on sovereign.tasks (lease_expires_at) where status = 'running';
 
-create table private.identity_settings (            -- exactly one row, seeded by migration
-  singleton              boolean primary key default true check (singleton),
-  network_key_version    smallint not null check (network_key_version between 1 and 255),
-  allow_dev_network_key  boolean  not null default false
+create table private.platform_settings (               -- exactly one row
+  singleton                       boolean primary key default true check (singleton),
+  execution_enabled               boolean not null default false,
+  global_daily_task_ceiling       integer not null check (global_daily_task_ceiling >= 0),
+  global_daily_token_ceiling      bigint  not null check (global_daily_token_ceiling >= 0),
+  global_hourly_provision_ceiling integer not null check (global_hourly_provision_ceiling >= 0),
+  net_hourly_provision_limit      integer not null check (net_hourly_provision_limit >= 0),
+  net_daily_provision_limit       integer not null check (net_daily_provision_limit >= 0),
+  visitor_active_task_limit       integer not null check (visitor_active_task_limit >= 0),
+  visitor_daily_task_limit        integer not null check (visitor_daily_task_limit >= 0)
 );
 
-create table private.rate_limit_settings (
-  bucket         text primary key check (bucket in ('provision_net_hour', 'provision_net_day',
-                                                    'provision_global_hour', 'username_visitor_day')),
-  window_length  interval not null check (window_length > interval '0'),
-  max_count      integer  not null check (max_count > 0)
+create table private.daily_usage (
+  day              date primary key,
+  tasks_submitted  integer not null default 0 check (tasks_submitted >= 0),
+  input_tokens     bigint  not null default 0 check (input_tokens >= 0),
+  output_tokens    bigint  not null default 0 check (output_tokens >= 0)
 );
 
-create table private.rate_limit_counters (
-  bucket        text not null references private.rate_limit_settings (bucket),
-  subject       bytea not null,
+create table private.provision_counters (
+  subject       bytea not null check (octet_length(subject) in (1, 32)),   -- '\x00' = global, 32 = network HMAC
   window_start  timestamptz not null,
+  window_kind   text not null check (window_kind in ('hour', 'day')),
   hit_count     integer not null check (hit_count > 0),
-  primary key (bucket, subject, window_start),
-  check (
-       (bucket in ('provision_net_hour', 'provision_net_day') and octet_length(subject) = 33)
-    or (bucket = 'provision_global_hour' and subject = '\x00'::bytea)
-    or (bucket = 'username_visitor_day'  and octet_length(subject) = 16)
-  )
+  primary key (subject, window_kind, window_start)
 );
-create index rate_limit_counters_window_start_idx on private.rate_limit_counters (window_start);
-
-create table private.session_events (
-  id           bigint generated always as identity primary key,
-  occurred_at  timestamptz not null default now(),
-  event        text not null check (event in ('rotated_reuse', 'invalid_lineage')),
-  session_id   uuid not null,     -- no foreign key: the event outlives the session row
-  visitor_id   uuid not null      -- no foreign key: kept until event retention (§6.8)
-);
-create index session_events_occurred_at_idx on private.session_events (occurred_at);
 ```
 
 Notes:
-- **Session lineage:** the composite foreign keys make a predecessor or successor of another visitor impossible. `on delete set null (column)` (PostgreSQL 15+) clears only the reference, never `visitor_id`. A successor whose predecessor row has been deleted keeps `origin = 'rotation'` and, if still pending, can only reach `invalid_lineage` (§5.5).
-- **One-to-one visitor ↔ workspace:** `workspaces.visitor_id` is `NOT NULL UNIQUE`. "At least one" holds because the only insert path, `provision_visitor`, creates both in one transaction and `sovereign_app` has no `INSERT` on either table. A deferrable "every visitor has a workspace at commit" constraint trigger is recommended as a second guard (D17).
-- **Deletion:** deleting a visitor cascades to its workspace, sessions and provisioning nonces. `session_events` rows are removed by their own retention.
-- **Timestamps:** `updated_at` is maintained by a `BEFORE UPDATE` trigger using `clock_timestamp()`.
-- **Session states** are derived from the columns exactly as §5.6 lists; there is no separate state column that could disagree.
-- **No slug, `kind` or membership table:** they existed for teams (ADR-0006), which are out of scope.
+- **One-to-one visitor ↔ workspace:** `workspaces.visitor_id` is `NOT NULL UNIQUE`, and the only insert path (`provision_visitor`) creates both in one transaction.
+- **Cascade:** deleting a visitor deletes its workspace, sessions and Tasks.
+- **Per-visitor daily Task limit** is counted from `tasks` (`created_at >= date_trunc('day', now())` for the workspace), so it needs no extra table.
+- The input `CHECK` (4,000) mirrors the proposal in §6.2; if the client changes the limit, the constraint changes with it in a migration.
+- `day` boundaries use the database's UTC date.
 
-### 6.4 Grants to `sovereign_app`
+### 7.4 Functions (all in `private`, owned by `sovereign_owner`, `SECURITY DEFINER`, `set search_path = ''`, fully qualified names, no dynamic SQL)
+| Function | `EXECUTE` granted to | Behaviour |
+|---|---|---|
+| `current_visitor_id() → uuid` (`STABLE`) | `sovereign_app` | Visitor of the `active` session whose hash is in the transaction setting (§7.6); else null. Read-only. |
+| `resolve_session(token_hash bytea, renew boolean) → (state, visitor_id, workspace_id, renewal_due)` | `sovereign_app` | §4.4. With `renew = true` and renewal due, extends `expires_at`, sets `last_renewed_at` and `visitors.last_seen_at`. |
+| `provision_visitor(token_hash bytea, username text, net_subject bytea) → (outcome, visitor_id, workspace_id)` | `sovereign_app` | Applies the global and (if `net_subject` is not null) per-network provisioning limits, then creates visitor, workspace and session. `outcome ∈ {created, rate_limited_network, rate_limited_global}`. |
+| `revoke_session(token_hash bytea) → boolean` | `sovereign_app` | Sets `revoked_at`, `revoke_reason = 'forgotten'` on an `active` session. |
+| `submit_task(agent_key text, agent_version text, input text, idempotency_key uuid) → (outcome, task_id)` | `sovereign_app` | §5.4. `outcome ∈ {queued, existing, paused, global_limit, active_limit, daily_limit, no_visitor}`. Increments `daily_usage.tasks_submitted` only for a new Task. |
+| `cancel_task(task_id uuid) → text` | `sovereign_app` | §5.10. `cancelled`, `cancel_requested`, `not_cancellable` or `not_found` (also for other visitors' Tasks). |
 
+Privileges of `sovereign_owner` (nothing else):
+- `sovereign.visitors`: `SELECT`, `INSERT`, `UPDATE (last_seen_at)`.
+- `sovereign.workspaces`: `SELECT`, `INSERT`.
+- `sovereign.visitor_sessions`: `SELECT`, `INSERT`, `UPDATE (last_renewed_at, expires_at, revoked_at, revoke_reason)`.
+- `sovereign.tasks`: `SELECT`, `INSERT`, `UPDATE (status, cancel_requested, finished_at)`.
+- `private.platform_settings`: `SELECT`. `private.daily_usage`: `SELECT`, `INSERT`, `UPDATE (tasks_submitted)`. `private.provision_counters`: `SELECT`, `INSERT`, `UPDATE (hit_count)`.
+- `USAGE` on both schemas. **No `DELETE`.** Owner-scoped RLS policies (`using/with check true`) exist for exactly these commands.
+
+Privileges of `sovereign_worker`:
+- `sovereign.tasks`: `SELECT`, `UPDATE (status, attempts, not_before, lease_token, lease_expires_at, output, output_truncated, error_code, model, input_tokens, output_tokens, started_at, finished_at)`; RLS policies for `select` and `update` (`using true`). No `INSERT` or `DELETE`.
+- `private.platform_settings`: `SELECT`. `private.daily_usage`: `SELECT`, `INSERT`, `UPDATE (input_tokens, output_tokens)`.
+- `USAGE` on both schemas. Nothing on `visitors`, `workspaces`, `visitor_sessions` or `provision_counters`.
+
+Privileges of `sovereign_app`:
+- `SELECT` on `sovereign.visitors`, `sovereign.workspaces`, `sovereign.tasks` (RLS: own rows only); `EXECUTE` on the six functions above; `USAGE` on both schemas. **No `INSERT`, `UPDATE` or `DELETE` on any table**, nothing on `visitor_sessions` or any `private` table.
+
+`EXECUTE` on every function is first revoked from `public`, `anon`, `authenticated` and `service_role`. Whether Supabase's default privileges add grants on new objects must be checked by the catalog tests (§12.2), not assumed.
+
+### 7.5 RLS
 ```sql
-revoke all on schema sovereign, private from public, anon, authenticated, service_role;
-revoke all on all tables in schema sovereign, private from public, anon, authenticated, service_role;
-grant usage on schema sovereign, private to sovereign_app;
-
-grant select on sovereign.visitors, sovereign.workspaces to sovereign_app;
--- No INSERT, UPDATE or DELETE on any table. No privileges on visitor_sessions, provisioning_nonces
--- or any private table. Username changes go through private.update_username.
+-- RLS enabled on every table in sovereign and private.
+create policy visitors_own   on sovereign.visitors   for select to sovereign_app
+  using (id = (select private.current_visitor_id()));
+create policy workspaces_own on sovereign.workspaces for select to sovereign_app
+  using (visitor_id = (select private.current_visitor_id()));
+create policy tasks_own      on sovereign.tasks      for select to sovereign_app
+  using (workspace_id = (select w.id from sovereign.workspaces w
+                         where w.visitor_id = (select private.current_visitor_id())));
+-- Owner and worker policies as listed in §7.4. No policies for anon, authenticated or service_role.
 ```
 
-- `EXECUTE` on every function in `private` is revoked from `public`, `anon`, `authenticated` and `service_role`; then exactly the functions marked for `sovereign_app` in §6.6 are granted to it.
-- Whether Supabase default privileges add grants on new objects must be checked, not assumed: the catalog tests (§9.2) assert the exact grant set.
-
-### 6.5 Visitor context per transaction
-
+### 7.6 Visitor context per transaction
 ```sql
 begin;
-select set_config('sovereign.session_token_hash', $1, true);  -- $1 = lowercase hex of sha256(token)
--- queries under RLS
+select set_config('sovereign.session_token_hash', $1, true);  -- lowercase hex of sha256(token)
+-- RLS-filtered reads and function calls
 commit;
 ```
-
-```sql
-create function private.current_visitor_id()
-returns uuid
-language sql stable security definer set search_path = ''
-as $$
-  select s.visitor_id
-  from sovereign.visitor_sessions s
-  where s.token_hash = case
-          when pg_catalog.current_setting('sovereign.session_token_hash', true) ~ '^[0-9a-f]{64}$'
-          then pg_catalog.decode(pg_catalog.current_setting('sovereign.session_token_hash', true), 'hex')
-        end
-    and s.revoked_at is null
-    and pg_catalog.now() < s.expires_at
-    and (s.origin = 'provisioning' or s.first_used_at is not null);
-$$;
-```
-
-- It is read-only (no first use, renewal or event recording) and accepts exactly the sessions listed in §5.6.
-- **Why the token hash, not a visitor id:** if the context were a visitor id, any SQL run as `sovereign_app` (for example through an SQL-injection bug) could set any id and satisfy every policy. With the hash, the context resolves only for a live session, and `sovereign_app` cannot read `visitor_sessions`. Arbitrary SQL as `sovereign_app` can therefore act only as visitors whose token hash it already knows. This narrows, but does not remove, the risk (§6.7).
-- **Pooling:** `set_config(..., true)` is transaction-local; PostgreSQL discards it at commit or rollback, so it cannot reach the next transaction on a pooled connection. The data-access helper (`withVisitor`) always opens an explicit transaction and sets the context first. Session-level `SET`/`set_config(..., false)` is forbidden in application code (static test, §9.1). Whether Supabase's pooler in transaction mode preserves this as expected is a hosted prerequisite (§6.10).
-
-### 6.6 Functions
-All functions: in `private`; owned by the role shown; `set search_path = ''`; every object reference fully qualified (`sovereign.visitors`, `pg_catalog.now()`); **no dynamic SQL** (no `EXECUTE`, no `format()`-built statements, no object names from arguments); arguments typed and validated as the first statements; generic errors without internal detail.
-
-| Function | Kind | Owner | `EXECUTE` granted to | Behaviour |
-|---|---|---|---|---|
-| `current_visitor_id() → uuid` | `SECURITY DEFINER`, `STABLE` | identity owner | `sovereign_app` | §6.5. Read-only. |
-| `provision_visitor(nonce_hash bytea, token_hash bytea, username text, net_subject bytea) → (outcome text, visitor_id uuid, workspace_id uuid)` | `SECURITY DEFINER` | identity owner | `sovereign_app` | §5.11 then §5.10. `outcome ∈ {created, joined, provisioning_expired, rate_limited_network, rate_limited_global, config_mismatch}`; ids only for `created`/`joined`. Malformed hashes or username raise a generic error. |
-| `touch_session(token_hash bytea, renew boolean) → (state text, visitor_id uuid, session_id uuid, expires_at timestamptz, renewal_due boolean, rotation_due boolean)` | `SECURITY DEFINER` | identity owner | `sovereign_app` | Exactly §5.5–§5.6. `visitor_id` only for `active`/`rotated_grace`; `session_id` only for `rotated_reused`/`invalid_lineage`; `expires_at` and the flags only for `active`. |
-| `rotate_session(old_hash bytea, new_hash bytea) → text` | `SECURITY DEFINER` | identity owner | `sovereign_app` | §5.5. Returns `issued`, `pending`, `not_due` or `not_active`. Only `issued` lets the caller set a cookie. |
-| `revoke_session(token_hash bytea) → boolean` | `SECURITY DEFINER` | identity owner | `sovereign_app` | §5.8. Revokes the presented session (if `active` or `rotated_grace`) and its unrevoked pending successors. |
-| `update_username(new_username text) → text` | `SECURITY DEFINER` | identity owner | `sovereign_app` | §5.11. Visitor from `current_visitor_id()`; returns `updated`, `taken`, `invalid`, `rate_limited` or `no_visitor`. |
-| `consume_limit(bucket text, subject bytea) → boolean` | `SECURITY INVOKER` (runs as the calling definer function's owner) | identity owner | **nobody** (revoked from `public`) | Internal helper; the bucket/subject `CHECK` and the settings row apply. |
-| `set_updated_at()` (trigger) | `SECURITY INVOKER` | identity owner | nobody | Timestamps. |
-| `cleanup_sessions()`, `cleanup_visitors()`, `cleanup_nonces()`, `cleanup_rate_limits()`, `cleanup_session_events()` | `SECURITY DEFINER` | maintenance owner | the maintenance executor (§6.8, D11) | Retention. Not granted to `sovereign_app`. |
-
-**Privileges held by `sovereign_identity_owner`** (granted by `postgres`; nothing else):
-- `sovereign.visitors`: `SELECT`, `INSERT`, `UPDATE (username, last_seen_at, updated_at)`.
-- `sovereign.workspaces`: `INSERT`. (No `SELECT`: `provision_visitor` generates the workspace id with `gen_random_uuid()` into a variable and inserts it explicitly, without `RETURNING`.)
-- `sovereign.visitor_sessions`: `SELECT`, `INSERT`, `UPDATE (first_used_at, last_renewed_at, expires_at, rotated_at, successor_id, revoked_at, revoke_reason, reuse_count, last_reuse_at)`. `origin`, `token_hash`, `visitor_id`, `predecessor_id` and `created_at` are never updated.
-- `sovereign.provisioning_nonces`: `SELECT`, `INSERT`, `UPDATE (visitor_id, mint_count)`.
-- `private.identity_settings`, `private.rate_limit_settings`: `SELECT`.
-- `private.rate_limit_counters`: `SELECT`, `INSERT`, `UPDATE (hit_count)`.
-- `private.session_events`: `INSERT` only.
-- `USAGE` on schemas `sovereign` and `private`. No `DELETE` anywhere.
-
-**Privileges held by `sovereign_maintenance_owner`** (column-level; cleanup needs no token, nonce or subject values):
-- `sovereign.visitor_sessions`: `SELECT (visitor_id, revoked_at, expires_at)`, `DELETE`. **No `SELECT` on `token_hash`.**
-- `sovereign.visitors`: `SELECT (id, created_at)`, `DELETE`. Cascaded deletes of workspaces, sessions and nonces are performed by PostgreSQL's referential actions and need no further privilege.
-- `sovereign.provisioning_nonces`: `SELECT (created_at)`, `DELETE`. **No `SELECT` on `nonce_hash`.**
-- `private.rate_limit_counters`: `SELECT (window_start)`, `DELETE`. **No `SELECT` on `subject`.**
-- `private.session_events`: `SELECT (occurred_at)`, `DELETE`.
-- `USAGE` on schemas `sovereign` and `private`. Cleanup functions use plain `DELETE … WHERE` on those columns only, without `RETURNING`.
-
-**RLS and the owner roles:** the owners are not table owners and do not have `BYPASSRLS`, so RLS applies to them. They receive owner-scoped policies (§6.7) covering exactly the commands above; column privileges then limit which columns those commands can read or write. This is an explicit, testable grant, not a bypass, and not available to `sovereign_app`.
-
-**Why a dedicated owner is safer, concretely:** a bug in a function body (for example a missing `where`) can only use the privileges listed above — it cannot drop or alter tables, read other schemas, use `DELETE` on the request path, or reach anything `postgres` can. Owning the functions with `postgres` would give every function body `postgres`'s privileges.
-
-### 6.7 RLS policies
-
-```sql
-alter table sovereign.visitors            enable row level security;
-alter table sovereign.workspaces          enable row level security;
-alter table sovereign.visitor_sessions    enable row level security;
-alter table sovereign.provisioning_nonces enable row level security;
-alter table private.identity_settings     enable row level security;
-alter table private.rate_limit_settings   enable row level security;
-alter table private.rate_limit_counters   enable row level security;
-alter table private.session_events        enable row level security;
-
--- Application role: read own rows only. No write policies.
-create policy visitors_select_self on sovereign.visitors
-  for select to sovereign_app using (id = (select private.current_visitor_id()));
-create policy workspaces_select_own on sovereign.workspaces
-  for select to sovereign_app using (visitor_id = (select private.current_visitor_id()));
-
--- Identity owner (using / with check true), one policy per table and command:
---   visitors: select, insert, update; workspaces: insert;
---   visitor_sessions: select, insert, update; provisioning_nonces: select, insert, update;
---   identity_settings: select; rate_limit_settings: select;
---   rate_limit_counters: select, insert, update; session_events: insert.
--- Maintenance owner: select and delete on visitors, visitor_sessions, provisioning_nonces,
---   rate_limit_counters, session_events (column privileges in §6.6 limit what it can read).
--- No policies for anon, authenticated or service_role. Test-cleanup policies exist only in
---   development databases (§6.8).
-```
-
-What RLS guarantees here:
-- **Does:** an application bug that forgets a filter, or passes another visitor's id, cannot read another visitor's rows through `sovereign_app`, and `sovereign_app` cannot write any table directly.
-- **Does not:** protect against a compromised web server, which receives live session cookies and holds the `sovereign_app` password. A custom PostgreSQL setting is not independently trustworthy: any code running SQL as `sovereign_app` can call `set_config`. The token-hash context limits such code to visitors whose hash it knows; it is defence in depth, not isolation from the server.
-- `postgres` owns the tables and is used only for migrations and operator work.
-
-### 6.8 Retention and cleanup (D11, D20)
-| Data | Deleted when | Function |
-|---|---|---|
-| Session rows | `validity_end < now() - 30 days` | `cleanup_sessions()` |
-| Visitors (with workspace, sessions, nonces) | **Abandoned**: `created_at < now() - 1 day` **and** no session of the visitor with `validity_end > now() - 30 days` | `cleanup_visitors()` |
-| Provisioning nonces | `created_at < now() - 1 day` | `cleanup_nonces()` |
-| Rate-limit counters | `window_start < now() - 2 days` | `cleanup_rate_limits()` |
-| Session events | `occurred_at < now() - 90 days` | `cleanup_session_events()` |
-
-Where `validity_end` of a session is `least(revoked_at, expires_at)` (PostgreSQL's `least` ignores a null `revoked_at`). A rotated predecessor's `expires_at` is its grace end, so the same formula covers it.
-
-Visitor cleanup safety:
-- A session that `current_visitor_id()` accepts, or that `touch_session` reports as `active` or `rotated_grace`, has `revoked_at is null` and `expires_at > now()`, so its `validity_end > now()`: the predicate can never select a visitor that holds one.
-- Validity only moves forward through renewal, which applies only to `active` sessions. An expired or revoked session never becomes valid again.
-- Sessions are created for an existing visitor only by rotation (requires an `active` predecessor, so the visitor is not abandoned) and by nonce joining (requires the nonce, and hence the visitor, to be younger than 10 minutes, while cleanup requires older than 1 day). So no session can be created for a visitor the predicate selects.
-- These facts, not lock timing, make cleanup safe. `cleanup_visitors()` deletes one candidate at a time with `delete … where id = $1 and <predicate>`, so the predicate is evaluated again at deletion. **Any future feature that creates sessions for existing visitors must re-examine this argument.**
-- **Orphans** (different-nonce provisioning, §5.10) are abandoned visitors whose only sessions were never used again; they follow the same rule (deleted about 210 days after creation). Deleting them earlier is not possible without risking a one-visit visitor who returns later.
-
-Executor: how cleanup runs on a schedule (Supabase `pg_cron`, if available on the project, or an operator-run job) is an **unresolved prerequisite** (D11). `sovereign_app` never runs cleanup.
-
-**Test-data cleanup (D20), development databases only:**
-- **Development-only objects**, created by a separate development setup script (reviewed SQL, **not** a migration, never applied to production):
-  - role `sovereign_test_cleanup` (attributes in §6.2);
-  - table `private.test_environment (singleton boolean primary key check (singleton), environment text not null check (environment = 'development'), project_ref text not null)` with exactly one row: the development project's ref;
-  - grants: `SELECT (id, username, created_at)` and `DELETE` on `sovereign.visitors`; `SELECT (visitor_id)` on `sovereign.workspaces`, `sovereign.visitor_sessions` and `sovereign.provisioning_nonces`; `SELECT` on `private.test_environment`; `USAGE` on both schemas; nothing else (in particular no `SELECT` on `token_hash` or `nonce_hash`);
-  - policies for that role: on `visitors`, `select` and `delete` **only where `username like 'zz-test-%'`**; on the three child tables, `select` only for rows whose visitor has that prefix; on `test_environment`, `select`.
-- **Configuration:** `SOVEREIGN_TEST_CLEANUP_DB_URL` and `SOVEREIGN_TEST_EXPECTED_PROJECT_REF` in the root `.env` (gitignored). **Neither has a default**, and neither is derived from any other variable.
-- **Before any delete, the harness verifies, and aborts with no `DELETE` issued if anything fails:**
-  1. Both variables are present and well-formed.
-  2. The URL's user and host name the expected project (Supabase pooler user `sovereign_test_cleanup.<ref>`, or a direct host containing `<ref>`); the exact URL form is a hosted assumption to verify (§6.10).
-  3. Connected as `sovereign_test_cleanup`: `current_user` matches; `pg_roles` shows not superuser, not `BYPASSRLS`, not `CREATEROLE`; `has_table_privilege` and `has_column_privilege` show `DELETE` on `sovereign.visitors` only, no `INSERT` or `UPDATE` anywhere, and no `SELECT` on `visitor_sessions.token_hash`.
-  4. `private.test_environment` has exactly one row with `environment = 'development'` and `project_ref` equal to the expected ref. On a production database the role and the table do not exist, so this check cannot pass.
-- **Deletion,** in one transaction that re-runs checks 3–4 first: `delete from sovereign.visitors where id = any($recorded_ids) and username like 'zz-test-%' and created_at >= $run_start`. The deleted row count must equal the number of recorded ids; otherwise roll back, abort and report sanitised ids (`support/diagnostics.ts` pattern).
-- **Afterwards:** zero rows in `visitors`, `workspaces`, `visitor_sessions` and `provisioning_nonces` for the recorded ids, and zero `zz-test-` visitors created since `run_start`. Any remainder is reported and fails the run.
-- **Independent guards:** recorded ids (primary), the `zz-test-` prefix in the statement (second), the RLS policy restricting the role to prefixed visitors (third), and the target checks above. No production role, function or privilege is involved; `sovereign_app` has no cleanup rights.
-- **Why there is no silent fallback:** the harness reads only those two variables. It never falls back to `SOVEREIGN_SQL_TEST_DB_URL`, a hard-coded host or any other setting; a missing or mismatching value stops the run before any deletion is attempted.
-
-### 6.9 Supabase settings
-- **Data API:** M2 does not need it — the browser never reads visitor data from Supabase, and `sovereign`/`private` are never exposed. Whether to **disable the Data API entirely** is a separate decision (D18), because it affects later features.
-- **Supabase Auth:** not used. New sign-ups and anonymous sign-ins are disabled in the dashboard so no `auth.users` rows can be created by holders of the publishable key.
-- The browser bundle carries no Supabase URL or key for visitor data.
-
-### 6.10 Hosted prerequisites and alternatives
-These must be verified on the hosted development project before implementation is considered viable:
-1. `postgres` can create `NOLOGIN` roles, grant them table and column privileges and `ALTER FUNCTION … OWNER TO` them (PostgreSQL 16+ requires the creator to hold `SET` membership in the new role).
-2. Custom login roles (`sovereign_app`, and in development `sovereign_test_cleanup`) can connect through Supabase's pooler, and the pooler's user-name format is as assumed in §6.8 (the existing `[VERIFY AT M2]` item for custom roles in DATA-MODEL §G.6).
-3. Transaction-mode pooling keeps transaction-local settings for the transaction's duration and clears them afterwards (verified by the pool-isolation tests, §9.3).
-4. A scheduler for maintenance functions exists, or an operator-run job is accepted (D11).
-5. The database supports `on delete set null (column_list)` (PostgreSQL 15+; the project's `config.toml` targets 17, to be confirmed on the hosted project).
-
-Fallbacks (each needs approval; none is assumed):
-- (1) fails → functions owned by `postgres`. This is explicitly **weaker**: function bodies then run with `postgres`'s privileges.
-- (2) fails → direct connection or session-mode pooler with a small server-side pool (same transaction-local rule), or a dedicated pooler user mapped to `sovereign_app`; target verification for test cleanup is then re-specified for that URL form.
-- (3) fails → pass the token hash as an explicit argument to SECURITY DEFINER data-access functions for every operation (no setting), at the cost of a function-only API.
-- (5) fails → the composite lineage keys need a different design (open).
-- **Not acceptable:** routine `service_role` or `postgres` access from the web server.
+- `current_visitor_id()` decodes the setting (must match `^[0-9a-f]{64}$`), finds a session with that hash, `revoked_at is null` and `now() < expires_at`, and returns its `visitor_id`; otherwise null, so every policy returns no rows.
+- `set_config(…, true)` is transaction-local; PostgreSQL discards it at commit or rollback, so it cannot leak to the next transaction on a pooled connection. The web server's data helper (`withVisitor`) always opens an explicit transaction and sets the context first. Session-level `SET` is forbidden in application code (static test, §12.1).
+- **Why a token hash and not a visitor id:** code running SQL as `sovereign_app` (for example via an injection bug) could set any visitor id; it cannot obtain token hashes, because `sovereign_app` cannot read `visitor_sessions`. It can therefore act only as visitors whose hash it already holds.
+- **What this does not protect against:** a compromised web server sees live cookies and holds the `sovereign_app` password; a compromised worker can read every Task. RLS is defence in depth against application bugs, not isolation from a compromised server.
 
 ---
 
-## 7. Application architecture
-
-### 7.1 First-visit provisioning
-1. A `GET` to an app path with neither cookie sets the nonce cookie (§5.10) and renders the app shell without a visitor.
-2. The shell's client component calls the `provisionVisitor` Server Action (`POST`).
-3. The action checks, in order: CSRF (§5.9); nonce cookie present (else `reload`); no session cookie (else `reload`); trusted client network established (§5.12; else generic `unavailable` in production, with no database call).
-4. It generates the session token and username, computes the network subject, hashes token and nonce, and calls `provision_visitor(nonce_hash, token_hash, username, net_subject)`. The database applies the limits (§5.11) and the nonce logic (§5.10). On a username collision it retries with a new name (≤ 5).
-5. `created`/`joined` → set the session cookie, delete the nonce cookie, return the workspace view. `provisioning_expired` → delete the nonce cookie and return `reload`. Limit and configuration outcomes → the generic messages in §5.11.
-
-### 7.2 Returning-visitor resolution and refresh
-- **Render path (`GET`):** `requireVisitor()` (server-only) reads the cookie and calls `touch_session(hash, renew = false)`. `active` and `rotated_grace` render the workspace; every other state renders the §2.6 notice (or provisioning when no cookie was sent). `rotated_reused` and `invalid_lineage` are logged as `{state, session_id}`.
-- **Refresh path (`POST`):** when `renewal_due` or `rotation_due` is true, the shell's client component calls `refreshSession`. It runs the CSRF checks, calls `touch_session(hash, renew = true)` and, if `rotation_due`, generates a new token and calls `rotate_session(old_hash, new_hash)`. It sets the cookie only when renewal happened (same token, new `Max-Age`) or rotation returned `issued` (new token). No other outcome writes the cookie.
-
-### 7.3 Username updates
-`updateUsername` Server Action: CSRF checks, `requireVisitor()`, server-side format and denylist validation, then `update_username(new_username)` inside `withVisitor`, so the transaction context supplies the visitor. Outcomes: `updated` → success; `taken` → "That name is taken."; `invalid` → validation message; `rate_limited` → §5.11 message; `no_visitor` → §2.6 notice.
-
-### 7.4 Workspace retrieval and data operations
-- `getPersonalWorkspace()` reads `sovereign.workspaces` inside `withVisitor`; RLS returns at most the visitor's own row.
-- Later domain operations use the same pattern: services in `packages/core` take an `Actor` resolved server-side; the `@sovereign/db` adapter runs them inside `withVisitor`.
-
-### 7.5 Cookie issuance and revocation summary
-| Event | Cookie written |
-|---|---|
-| Provisioning `created`/`joined` | Session cookie set; nonce cookie deleted |
-| Provisioning `provisioning_expired` | Nonce cookie deleted |
-| Refresh with renewal | Same token, new `Max-Age` |
-| Rotation `issued` | New token |
-| "Forget this browser" | Session cookie deleted after `revoke_session` |
-| "Start a new workspace" with an invalid cookie (§7.6) | Session and nonce cookies deleted; no new cookie in that response |
-| Any validation failure | **Nothing** |
-
-### 7.6 "Start a new workspace" (explicit, after an invalid cookie)
-1. The §2.6 notice offers the button. It calls the `startNewWorkspace` Server Action (`POST`), which runs the CSRF checks.
-2. The action hashes the presented session cookie and calls `touch_session(hash, renew = false)`:
-   - `active` or `rotated_grace` (the cookie works after all, e.g. after a transient error) → return `reload`; **nothing is deleted**. This action never discards a valid session.
-   - any other state, or no session cookie → the response deletes the session cookie **and** any nonce cookie and returns `reload`. No database row changes; the old visitor, if any, is left to retention (§6.8).
-3. The client performs a full navigation `GET /workspace`. That request carries neither cookie, so the response sets a fresh nonce cookie (§5.10, D19). `GET` still creates no database rows.
-4. The app shell provisions as on a first visit (§7.1) using that nonce.
-
-Failures and retries:
-- **Action fails** (network error, CSRF rejection): the notice stays; nothing was changed; the visitor can press the button again.
-- **Cookie deletion did not take effect** (the session cookie is still sent): the navigation shows the §2.6 notice again; pressing the button repeats steps 1–3.
-- **No nonce after navigation** (cookies blocked): provisioning returns `reload`; the client reloads **once** (tracked in page state, e.g. an `?attempt=2` marker) and then shows "Cookies are required to use Sovereign". No loop.
-- **Provisioning fails** with a limit or `unavailable`: the generic message and a "Try again" button that re-sends the provisioning `POST` with the same nonce while it is valid; `provisioning_expired` or a missing nonce leads to one reload for a fresh nonce.
-
-### 7.7 Errors
-Typed results `{ ok, data } | { ok: false, error }`, `error ∈ { no_visitor, invalid_session, reload, cookies_required, rate_limited, validation, conflict, unavailable }`. Client messages are generic. Logs carry no tokens, nonces, hashes, cookie values, IP addresses or network subjects; they may carry visitor ids, session ids, state names and outcome names.
-
----
-
-## 8. Mapping to the current source (read-only inventory)
+## 8. Application structure (mapped to the current source, read-only inventory)
 
 ### 8.1 Status of the existing account-based M2 work
-Based on the evidence previously recorded in this project's working session — **not re-verified for this revision, and no Git commands were run**:
-- At the start of that session, `HEAD` was `10013c0` ("feat: checkpoint Sovereign landing page and realm work"), and the account-based M2 files (for example `apps/web/src/app/auth/`, `apps/web/src/lib/`, `packages/db/supabase/`) were listed by `git status` as **untracked**.
-- Later recorded measurements showed the same `HEAD`, zero staged files and an unchanged working-tree status hash.
-- On that evidence the account-based M2 work is **not contained in any commit on record**. It has not been merged or pushed. It has **never been applied to a hosted database**.
-- If the work has since been committed locally (for example in a checkpoint made outside that session), this paragraph must be updated from verified Git evidence; it should then read "committed locally, not necessarily merged or pushed, never applied to a hosted database".
+Based on evidence recorded earlier in the project's working session — **not re-verified for this revision; no Git commands were run**: at that session's start `HEAD` was `10013c0` and the account-based M2 files were untracked; later measurements showed the same `HEAD` and nothing staged. On that evidence the account-based work is not contained in any commit on record, has not been merged or pushed, and has never been applied to a hosted database. If it has since been committed locally, this paragraph must be updated from verified Git evidence.
 
-### 8.2 Existing files and their fate under this specification
+### 8.2 Existing files and their fate
 | Area | Files | Fate |
 |---|---|---|
-| Auth pages and actions | `apps/web/src/app/auth/{actions.ts, AuthShell.tsx, auth.css, callback/route.ts, sign-in, sign-up, verify-email, reset-password, update-password}` | Removed. `AuthShell.tsx`/`auth.css` styling may be reused for the §2.6 notice. |
-| Auth helpers | `apps/web/src/lib/auth/{gate.ts, auth-outcome.ts, next-path.ts}`, `apps/web/src/server/auth.ts` | Replaced by `server/visitor.ts`. |
-| Supabase clients | `apps/web/src/lib/supabase/{browser.ts, server.ts, session.ts, config.ts}` | Removed from the visitor path. |
-| Proxy | `apps/web/src/proxy.ts` | Repurposed to set the provisioning-nonce cookie only (D19). |
-| Canonical origin | `apps/web/src/lib/site-origin.ts` | Kept; source of the Origin check. |
-| Workspace page | `apps/web/src/app/(app)/workspace/page.tsx` | Rewritten against `requireVisitor`/`getPersonalWorkspace`. |
-| Composition root | `apps/web/src/server/composition.ts` | Gains the database adapter wiring. |
-| DB configuration | `packages/db/src/config.ts` (`parseWorkerDatabaseUrl` rejects over-privileged roles) | Pattern reused for an application database URL that must use `sovereign_app`. |
-| Env declarations | `apps/web/src/env.d.ts` | Gains server-only names for the application database URL (D16), `SOVEREIGN_RATE_LIMIT_KEY`, `SOVEREIGN_RATE_LIMIT_KEY_VERSION` and `SOVEREIGN_CLIENT_IP_HEADER`; `NEXT_PUBLIC_SUPABASE_*` not needed for M2. |
-| Migrations | `packages/db/supabase/migrations/20261112120000_m2_schemas_privileges.sql`, `20261112120100_m2_identity.sql` | Depend on `authenticated`, `auth.users`, `auth.uid()`. To be **replaced**, not amended — requires approval. |
-| pgTAP | `packages/db/supabase/tests/{identity_signup, identity_rls, catalog}.test.sql` | Replaced (§9.2). The control `_selftest/deliberate_failure.test.sql`, the manifest rules and the runner (`scripts/run-sql-tests.mjs`, `scripts/tap.mjs`) are kept. |
-| Integration tests | `apps/web/test/integration/{auth.test.ts, support/admin.ts, support/env.ts, support/user.ts}` | Replaced (§9.3). `support/diagnostics.ts` (sanitised cleanup reports) is reusable. The service-role key is no longer needed. |
-| Guards | `apps/web/test/service-role-isolation.test.ts`, `scripts/check-client-bundle.mjs`, ESLint rules | Kept; extended so the application database URL and the rate-limit key never reach client code or bundles. |
-| Dependencies | `@supabase/ssr`, `@supabase/supabase-js` (web), `supabase` CLI (db) | JS clients unused for M2. A PostgreSQL driver is required — a new dependency (D16). |
+| Auth pages, actions, helpers | `apps/web/src/app/auth/**`, `apps/web/src/lib/auth/**`, `apps/web/src/server/auth.ts` | Removed (no accounts). `AuthShell.tsx`/`auth.css` styling may be reused for notices. |
+| Supabase JS clients and proxy | `apps/web/src/lib/supabase/**`, `apps/web/src/proxy.ts` | Removed from the visitor path; the beta needs no proxy logic. |
+| Canonical origin | `apps/web/src/lib/site-origin.ts` | Kept for the Origin check. |
+| Workspace page | `apps/web/src/app/(app)/workspace/page.tsx` | Rewritten: Task list, Task form, Task view. |
+| Composition roots | `apps/web/src/server/composition.ts`, `apps/worker/src/composition.ts`, `apps/worker/src/main.ts` | Gain database adapters; the worker gains the claim loop and model adapter. |
+| DB configuration | `packages/db/src/config.ts` (`parseWorkerDatabaseUrl` already rejects `postgres`, `supabase_admin`, `service_role`, `authenticator`) | Reused for the worker; same pattern for the web URL requiring `sovereign_app`. |
+| Core | `packages/core/src` (health only) | Gains the agent catalogue, Task validation schemas and the `ModelProvider` port. |
+| Demo data | `apps/web/src/demo/**` | Stays for public pages until replaced; never shown as real Task results. |
+| Migrations | `packages/db/supabase/migrations/20261112120000_m2_schemas_privileges.sql`, `20261112120100_m2_identity.sql` | Depend on `auth.users`/`auth.uid()`. **Replaced**, not amended (requires approval). |
+| pgTAP and runner | `packages/db/supabase/tests/**`, `scripts/run-sql-tests.mjs`, `scripts/tap.mjs` | Suite files replaced (§12.2); control file, manifest rules and runner kept. |
+| Integration tests | `apps/web/test/integration/**` | Replaced (§12.3); `support/diagnostics.ts` reusable. Service-role key no longer needed. |
+| Guards | `apps/web/test/service-role-isolation.test.ts`, `scripts/check-client-bundle.mjs`, ESLint rules | Kept; extended so the database URLs and the model API key never reach client code or bundles. |
+| Dependencies | `@supabase/ssr`, `@supabase/supabase-js` | Unused by the beta. New: a PostgreSQL driver and a model-provider client (both need approval, §11). |
 
-### 8.3 Proposed new structure (not created)
-- `apps/web/src/server/visitor.ts` (`server-only`): cookies, token and nonce generation and hashing, `requireVisitor`, `withVisitor`, CSRF checks, client-network extraction and network-subject HMAC.
-- `apps/web/src/app/(app)/workspace/actions.ts`: `provisionVisitor`, `refreshSession`, `updateUsername`, `forgetThisBrowser`, `startNewWorkspace`.
-- `apps/web/src/app/(app)/workspace/SessionKeeper.tsx` (client): provisioning, refresh and the single-reload rule.
-- `packages/db/src/app-database.ts`: driver wrapper exposing only `withVisitor` and the §6.6 functions granted to `sovereign_app`.
-- Development-only: the test setup SQL (§6.8) and the cleanup harness with its target checks.
-
----
-
-## 9. Testing requirements
-None of these tests exists. Counts are intentionally not stated.
-
-### 9.1 Unit (offline, Vitest)
-- Token and nonce generation: 32 bytes, base64url, 43 characters; hashes are SHA-256 of the raw bytes.
-- Cookie attributes for both cookies, production and `http://localhost` variants (§5.2); session `Max-Age` equals remaining lifetime.
-- CSRF checks: missing `Origin` rejected; foreign origin rejected; canonical accepted; `Sec-Fetch-Site: cross-site` rejected; `Host`/`X-Forwarded-Host` ignored.
-- Client network (§5.12): with no configured header, any `X-Forwarded-For`, `Forwarded` or `X-Real-IP` is ignored and the result is "untrusted"; with a configured header, a single valid address is accepted and lists, ports and garbage are untrusted; IPv6 reduced to /64; IPv4-mapped IPv6 treated as IPv4; production without a trusted address never calls `provision_visitor`; the loopback development branch never activates for a non-loopback origin.
-- Network subject: always 33 bytes; version byte equals the configured version; the same network gives the same subject; the subject never appears in logs.
-- Provisioning action order (§7.1): each failing precondition stops before the database call.
-- `requireVisitor`: every `touch_session` state maps to the right render outcome; malformed cookie makes no database call; `rotated_reused` and `invalid_lineage` log exactly `{state, session_id}`; a throwing logger does not change the result.
-- Cookie writes: no validation failure produces `Set-Cookie` for the session cookie; refresh writes only on renewal or `issued`.
-- `startNewWorkspace`: a valid session is never deleted; an invalid one causes deletion of both cookies and `reload`; the client reloads at most once without a nonce.
-- Cleanup harness target checks (with a fake connection): missing `SOVEREIGN_TEST_CLEANUP_DB_URL` or expected ref → abort; URL naming another project → abort; unexpected `current_user`, role attributes or extra privileges → abort; missing, duplicated or mismatching `test_environment` row → abort; deleted-count mismatch → rollback and abort. In every abort case no `DELETE` statement is issued.
-- Username validation, generator validity, reserved names including the test prefix.
-- Logs: sentinel tokens, nonces, hashes, IPs and network subjects never appear in any log line.
-- Static guards: no session-level `SET` or `set_config(..., false)` in application SQL; the application database URL and rate-limit key never appear in client bundles.
-
-### 9.2 Database / RLS (pgTAP via `pnpm test:rls`, control first; everything rolled back)
-- **Session states:** for each of `invalid_input`, `unknown`, `revoked`, `rotated_grace`, `rotated_reused`, `expired`, `invalid_lineage`, `active`, `touch_session` returns exactly the §5.6 columns and performs exactly the listed writes; `current_visitor_id()` agrees with §5.6.
-- **Boundaries:** `now()` is fixed within the test transaction, so tests arrange `expires_at` relative to it: `now() + interval '1 microsecond'` → `rotated_grace`; exactly `now()` → `rotated_reused`; the same pattern for `active` versus `expired`.
-- **Initial-session first use:** sets only its own `first_used_at`; no other row changes (snapshot before and after); no rotation field is set; a second first use changes nothing.
-- **Successor first use:** completes the predecessor exactly once (`rotated_at`, `successor_id`, grace `expires_at`) and supersedes other pending successors.
-- **Lineage failures, each → `invalid_lineage`, no session changed, one event row:** predecessor deleted (`predecessor_id` null on an `origin = 'rotation'` row); predecessor revoked; predecessor's `successor_id` points at another successor. A superseded successor → `revoked`.
-- **Lineage constraints:** an `origin = 'provisioning'` row with a predecessor is rejected; a predecessor or successor belonging to another visitor is rejected by the composite key; self-references are rejected; deleting a predecessor sets only `predecessor_id` to null.
-- **Pending successor and context:** before completion, `current_visitor_id()` does not resolve a pending successor; after completion it does.
-- **Renewal:** `active` renews only with `renew = true` after 24 hours; a rotated predecessor never renews.
-- **Reuse:** each presentation after grace increments `reuse_count`, sets `last_reuse_at` and adds one `rotated_reuse` event with the right session and visitor ids; presentation during grace records nothing; a forced event-insert failure makes the call fail, with `reuse_count` unchanged and no visitor returned.
-- **Rotation:** `issued` creates one successor (`origin = 'rotation'`) and leaves the predecessor `active`; a recent pending successor → `pending`; an old one → `superseded`; `not_due` and `not_active` change nothing.
-- **Provisioning:** `created` creates exactly one visitor, workspace, initial session and nonce row; `joined` adds an initial session to the same visitor; expired window and `mint_count = 5` → `provisioning_expired`; invalid input creates nothing; a forced failure leaves no partial rows.
-- **Rate limits through the functions only:**
-  - spoofed or malformed network subjects (32 or 34 bytes, wrong version byte, null, the development subject with `allow_dev_network_key = false`) → `config_mismatch`, nothing consumed or created;
-  - every attempt that passes the network check consumes the global bucket with exactly `\x00`, even when each attempt uses a different network subject, so varying subjects stops at the global limit;
-  - `update_username` consumes `username_visitor_day` with the context's visitor id; with no context → `no_visitor`, nothing consumed; the limit is reached after the configured count;
-  - inserts into `rate_limit_counters` with a wrong-length subject, a non-`\x00` global subject or an unknown bucket fail the constraints (run as the owner role to test the constraint itself);
-  - `sovereign_app` cannot execute `consume_limit`, cannot write any counter and cannot read any `private` table.
-- **One-to-one:** a second workspace for a visitor fails; a workspace without a visitor fails; the deferrable "visitor has a workspace" check, if approved (D17).
-- **Isolation as `sovereign_app`:** A's context cannot select B's visitor or workspace row; `sovereign_app` cannot update any table directly.
-- **Spoofing:** a fabricated hash, B's visitor id or malformed text in the context resolves to no visitor; `sovereign_app` cannot select `visitor_sessions`, `provisioning_nonces` or `session_events`, and cannot execute maintenance functions.
-- **Transaction-local context:** after commit and after rollback, the setting is empty in the same connection.
-- **Cleanup:** never deletes a visitor with a session `current_visitor_id()` accepts; deletes an abandoned visitor with cascade; leaves visitors younger than 1 day; session, nonce, counter and event cleanup follow §6.8.
-- **Catalog:**
-  - role attributes for `sovereign_app` and both owners (no `SUPERUSER`, no `BYPASSRLS`, owners `NOLOGIN`);
-  - every function in `private`: expected `prosecdef`, `proconfig = {search_path=""}`, expected `proowner`, no `EXECUTE` or `format(` in `prosrc`, execute ACL exactly as §6.6 (`consume_limit` and the trigger function executable by no other role);
-  - exact table **and column** privileges of every role, including that `sovereign_maintenance_owner` has no `SELECT` on `visitor_sessions.token_hash`, `provisioning_nonces.nonce_hash` or `rate_limit_counters.subject`, and `sovereign_app` has no write privilege;
-  - RLS enabled on all eight tables; the exact policy set (§6.7);
-  - `sovereign_test_cleanup` and `private.test_environment` are **absent** from the migration-built schema (they exist only after the development setup script).
-
-### 9.3 Visitor-session integration (Vitest against the hosted development database)
-- **Transaction-pool isolation:** with the client pool forced to one connection, a transaction with visitor A's context followed by one without context sees nothing in the second; many interleaved concurrent A/B transactions never see each other's rows.
-- **Same-nonce concurrency:** N parallel `provision_visitor` calls with one nonce → one visitor, `created` once and `joined` for the rest up to the mint limit, then `provisioning_expired`.
-- **Different-nonce interleaving:** parallel calls with different nonces → different visitors, each with exactly one workspace.
-- **Retries and refreshes:** repeating a call with the same nonce after success → `joined`, same visitor.
-- **Concurrent first use:** many parallel `touch_session` calls with one new initial session leave exactly one `first_used_at` and change nothing else; with one new successor, the predecessor is completed exactly once.
-- **Old token during and after grace:** repeated use within grace succeeds; after grace each use is `rotated_reused` with one event each; the successor keeps working throughout.
-- **Rotation races:** parallel refreshes with one predecessor → exactly one `issued`.
-- **Lost rotation response:** an issued successor never used → predecessor stays `active`; a refresh after 10 minutes supersedes it and issues a new one.
-- **Rate limits across instances:** two independent connection pools (two simulated application instances) provisioning from one network share one count; varying network subjects across both pools still stop at the global limit.
-- **Cleanup safety:** cleanup run concurrently with session activity and with orphan visitors from different-nonce provisioning never deletes a visitor holding a valid session, and does delete eligible orphans.
-- **Test-data cleanup:** every created visitor is recorded immediately and removed through the D20 path; the target checks pass only against the development project; a final check finds no remaining test visitors, workspaces, sessions or nonces; failures are reported with sanitised ids only.
-
-### 9.4 Server Action / API integration (Vitest, server code against the development database)
-- `provisionVisitor`: duplicated and retried requests with one nonce → one visitor; missing nonce → `reload`; session cookie present → `reload` without any database write; spoofed forwarding headers ignored; missing trusted address in production configuration → generic `unavailable` without a database call; limits enforced across two server instances sharing the database.
-- `refreshSession`: renewal re-issues the cookie with matching `Max-Age`; rotation `issued` sets a new token; `pending`, `not_due`, `not_active` set no cookie.
-- `updateUsername`: taken → conflict; invalid → validation; limit enforced per visitor regardless of request input; another visitor unchanged.
-- `startNewWorkspace`: with a valid cookie → `reload`, nothing deleted; with an invalid cookie → both cookies deleted and `reload`; the following `GET` sets a nonce; provisioning then succeeds with it.
-- `forgetThisBrowser`: the session and its pending successors are revoked; the cookie is deleted.
-- Spoofed ids in form data or headers are ignored everywhere.
-
-### 9.5 Browser (manual at G7 until an E2E tool is approved; Playwright is listed in ADR-0001 but not installed)
-- Fresh profile → `/workspace` → workspace appears without any form; both cookies' attributes correct; nonce cookie gone after success.
-- Several tabs opened at once in a fresh profile → usually one shared visitor; if two visitors appear, the browser ends with one valid session and the other visitor is an orphan (expected per §5.10).
-- Reload during provisioning → same visitor.
-- Reload and full browser restart → same username and workspace.
-- Username edit persists across restart.
-- Delete the session cookie → automatic provisioning of a new visitor. With a tampered or revoked cookie → the §2.6 notice; the cookie is not replaced until "Start a new workspace", which then provisions through a fresh nonce.
-- Two profiles A and B → each sees only its own workspace.
-- A page on another origin auto-submitting a `POST` to a Server Action is rejected without state change.
-- "Forget this browser" → warning, then access ends.
-
-### 9.6 Rotation in the browser
-Rotation needs a 30-day-old token; it is verified in §9.2–§9.4 with arranged timestamps rather than manually.
-
-### 9.7 Test-data rules
-Test visitors use the reserved prefix `zz-test-` (database-level tests pass it directly; server-level tests inject a test username generator that produces it), are created only by the test harness, and are deleted per D20 by recorded id.
+### 8.3 New modules (proposed, not created)
+- `apps/web/src/server/visitor.ts` (`server-only`): cookie, token, hashing, `requireVisitor`, `withVisitor`, CSRF checks.
+- `apps/web/src/app/(app)/workspace/actions.ts`: `provisionVisitor`, `refreshSession`, `submitTask`, `getTask`, `listTasks`, `cancelTask`, `startNewWorkspace`, `forgetThisBrowser`.
+- `packages/core`: agent catalogue, Zod schemas, `ModelProvider` port, retry classification.
+- `packages/db`: `app-database.ts` (web, `sovereign_app`) and `worker-database.ts` (worker, `sovereign_worker`).
+- `apps/worker`: claim loop, lease sweep, model adapter, sanitised logging.
 
 ---
 
-## 10. Consequences for the rest of the blueprint (deferred; not part of M2)
-- **Cost and abuse for agent runs (M4b/M5):** the PRD's verified-email gate disappears. A replacement is required before any run can spend money (per-visitor and per-workspace budgets, provisioning controls, possibly a human-verification challenge).
-- **Realtime (ADR-0005):** private channels authorised by Supabase Auth JWTs no longer apply. Options: server-sent events from the Sovereign server, or server-minted short-lived tokens for Realtime (a new signing credential).
-- **Operators, admin and moderation:** need an operator identity separate from visitor identity; reading `session_events` is an operator task until then.
-- **Public profiles, publishing, reports:** usernames are not proof of a person; impersonation and squatting policies are needed if usernames become public.
-- **Teams (ADR-0006):** dropped from the schema; re-adding them is a schema migration.
-- **Storage:** any use must go through the server.
-- **Privacy:** retention values (D11) and the lawful basis for storing network subjects (D13).
+## 9. Operations during the beta
+
+### 9.1 Visibility (minimum)
+- Structured logs from web and worker: Task id, workspace id, agent key, status transitions, attempt, duration, token counts, `error_code`. No secrets, no Task text, no outputs in logs.
+- Operator SQL (documented in the runbook): queue depth and oldest queued Task; Tasks per status in the last hour; failure rate by `error_code`; today's `daily_usage` against ceilings; provisioning counts.
+- Worker liveness: the operator can see whether Tasks are being claimed (oldest `queued` age). An automated alert is required before increasing traffic (§10 B).
+
+### 9.2 Operator controls
+- Kill switch: `update private.platform_settings set execution_enabled = false`.
+- Ceiling changes: update `platform_settings`.
+- Session revocation: §4.6. Operator actions run as `postgres` in the SQL editor — operator access, not application runtime.
+
+### 9.3 Cleanup (manual during the beta)
+- Abandoned visitors: delete visitors older than 1 day that have **no session with `least(revoked_at, expires_at) > now() - interval '30 days'`**. A visitor holding a valid session can never match (its `expires_at > now()`), and no code path creates a session for an existing visitor, so the rule cannot delete a usable workspace. Cascades remove workspace, sessions and Tasks.
+- Old sessions: delete sessions with `least(revoked_at, expires_at) < now() - interval '30 days'`.
+- Counters: delete `provision_counters` rows older than 2 days; keep `daily_usage`.
+- Run by an operator as `postgres` (weekly is sufficient at beta volume). Automated scheduling is deferred (D11).
+
+### 9.4 Data, privacy and backups
+- Stored per visitor: generated username, timestamps, session hashes, Task text, outputs, token counts. No email, wallet or payment data.
+- Task text may contain anything a visitor types. A short notice near the Task form ("Don't include personal or sensitive information") and a privacy statement are a **client decision** (D35) and a launch item (§10 A).
+- Task retention period: **client decision** (D35); until decided, Tasks live as long as their visitor.
+- Backups: what the hosted project's plan provides (frequency, point-in-time recovery, retention) is **unverified**. The client must either confirm the plan's backups or accept that a database loss during the beta loses visitors' workspaces (D36). A restore rehearsal is deferred (§10 C).
 
 ---
 
-## 11. Decision register
+## 10. Public-beta launch checklist
 
-Labels: **AR** = accepted product requirement · **RD** = recommended design awaiting user approval · **UP** = unresolved technical prerequisite · **DL** = deferred to a later milestone.
+### A. Mandatory before public exposure
+Security and isolation:
+- [ ] Session design of §4 implemented: 256-bit tokens, hash-only storage, cookie attributes, server-side validation, expiry, revocation, invalid-cookie handling.
+- [ ] CSRF/Origin checks on every state-changing request (§4.7).
+- [ ] Roles, grants, RLS and functions of §7 applied; catalog tests pass against the hosted development project (no `BYPASSRLS`, no table writes for `sovereign_app`, exact grants and policies).
+- [ ] Visitor A/B isolation tests pass for visitors, workspaces and Tasks, including cancel and spoofed ids (§12).
+- [ ] No database credential, model API key or service-role key in browser bundles (`check:bundle` on a fresh production build) or in the repository.
+- [ ] Web server uses only `sovereign_app`; worker uses only `sovereign_worker`; neither uses `postgres` or `service_role`.
+Agent reliability:
+- [ ] Agent catalogue with real instructions approved by the client (D26); model chosen (D32).
+- [ ] Task lifecycle of §5 works end to end against the real provider: submit, claim, success, retryable failure, terminal failure, timeout, lease recovery, cancel, queue timeout, idempotent resubmission.
+- [ ] Outputs rendered through the markdown sanitiser; error messages generic.
+Cost and abuse:
+- [ ] Kill switch, global daily Task ceiling, global daily token ceiling, global provisioning ceiling, per-visitor active and daily limits, input/output caps, timeouts, attempt cap, worker concurrency — all configured with client-approved values (D30).
+- [ ] Provider-side spend limit set, if the provider offers one; otherwise the client accepts that the in-app token ceiling is the only spend stop (D30).
+- [ ] Decision on per-network limiting for the first exposure (D14).
+Operations:
+- [ ] Logs from web and worker reachable by the operator; operator SQL for queue, failures and usage available (§9.1).
+- [ ] Operator procedure for kill switch, ceilings and revocation written down (§9.2).
+- [ ] Backup position confirmed or accepted (D36); Task-input notice and privacy statement decided (D35).
+- [ ] Hosted prerequisites P1–P6 verified (§11).
+- [ ] Hosted verification runbook revised for this design and executed gate by gate with recorded evidence. **A build that compiles and local tests that pass are not sufficient.**
 
-| # | Decision | Label | Notes |
-|---|---|---|---|
-| D1 | Accountless identity: server-generated visitor id, HttpOnly bearer session, no Supabase Auth for visitors; username display-only; same-profile persistence only; no cross-device recovery; cookie loss may lose the workspace | **AR** (2026-11-12) | |
-| D2 | Identity tables in non-exposed schema `sovereign`; support tables and functions in `private` | RD | |
-| D3 | Username format `^[a-z0-9][a-z0-9_-]{2,23}$`, generator `adjective-noun-NN` | RD | |
-| D4 | Unique usernames (case-insensitive by lowercase-only format) | RD | |
-| D5 | Reserved-name denylist including the test prefix `zz-test-` | RD | |
-| D6 | No visitor rows from `GET`; provisioning only by same-origin `POST` | RD | |
-| D7 | Invalid cookie → notice; "Start a new workspace" clears the cookies, then provisions through a fresh nonce (§7.6); "Forget this browser" with warning | RD | |
-| D8 | 180-day sliding idle lifetime; renewal ≥ 24 h apart, only for `active`, only in the refresh `POST`, cookie re-issued with matching `Max-Age`; no absolute cap | RD | Inactivity > 180 days loses the workspace |
-| D9 | Cookie names `__Host-sovereign_session` / `__Host-sovereign_provision`; unprefixed names only on `http://localhost` | RD | |
-| D10 | Session origins (`provisioning`/`rotation`) with separate first-use paths; rotation every 30 days; completion on successor first use with lineage checks (`invalid_lineage` fails closed); 120 s grace from completion, strict boundary; ≤ 1 recent pending successor (10 min); reuse recorded, no visitor-wide revocation | RD | |
-| D11 | Retention: sessions 30 days after validity ends; abandoned visitors (older than 1 day, no session valid within 30 days) deleted with predicate re-check; nonces 1 day; counters 2 days; session events 90 days | RD (values and rules) · **UP** (scheduler: `pg_cron` availability or operator job) | |
-| D12 | Synchronizer CSRF token | **DL** | Origin + `Sec-Fetch-Site` + `SameSite=Lax` required in M2 |
-| D13 | Rate limits and global circuit breaker, enforced inside `provision_visitor` and `update_username` with canonical subjects | **AR** that they are mandatory before public deployment (user directive, 2026-11-12) · RD for the values and the database-enforced design | Shared-address trade-off needs approval |
-| D14 | Trusted client-IP header | **UP** | Provider not selected; fail closed until configured (§5.12) |
-| D15 | SECURITY DEFINER functions owned by `NOLOGIN` roles `sovereign_identity_owner` and `sovereign_maintenance_owner` with explicit, column-level privileges and owner-scoped RLS | RD · **UP** (hosted role-creation and ownership support, §6.10) | Fallback to `postgres` ownership is weaker and needs separate approval |
-| D16 | PostgreSQL driver (new dependency), pooler mode, connection limit, application database URL variable name | **UP** — not approved | Needs compatibility review and dependency approval |
-| D17 | Deferrable "visitor has a workspace" constraint trigger | RD | |
-| D18 | Data API: not needed by M2 (design fact); disabling it entirely | Disabling: **DL** | Decide when Realtime/Storage plans are set |
-| D19 | Proxy sets only the provisioning-nonce cookie, when neither cookie is present (no database access); session cookies written only by Server Actions | RD · **UP** (verify Next.js 16 proxy behaviour for cookie writes on prefetch and RSC requests before relying on it) | Proxy database access not recommended |
-| D20 | Test cleanup through a development-only role, marker table and policies; harness verifies target, role and privileges and aborts before any delete; deletes only recorded ids with the prefix as second guard | RD · **UP** (pooler user-name format for target verification, §6.10) | No production role, function or privilege |
-| D21 | Provisioning nonce: idempotency per nonce, 10-minute life, ≤ 5 mints; different nonces may create different visitors | RD | Tab coordination is a mitigation only |
-| D22 | Reuse and lineage events recorded inside `touch_session` in `private.session_events`; app receives and logs only `{state, session_id}`; event-write failure fails the call | RD | |
-| D23 | Username changes only through `update_username` (visitor from transaction context); `sovereign_app` has no table write privileges | RD | |
-| D24 | Network subject format (version byte + HMAC-SHA-256), key version held in `private.identity_settings`, development subject only where explicitly allowed | RD | Variable names proposed |
+### B. Required before increasing traffic
+- [ ] Trusted client-IP source verified and per-network provisioning limits enabled (D14).
+- [ ] Automated alerting: worker not claiming, failure rate high, usage near ceilings.
+- [ ] Load check of the claim loop and provider rate limits at the planned concurrency.
+- [ ] Scheduled cleanup instead of manual (D11).
+- [ ] Review of real costs per Task against the ceilings; adjust values.
+- [ ] Browser end-to-end tests automated (Playwright needs dependency approval).
+
+### C. Can wait until feedback validates the product
+- Session rotation and reuse detection (D10, D22); username editing and uniqueness (D4, D23).
+- Tools for agents (`web_search`, `web_fetch`), tool idempotency and SSRF guard (D27).
+- Realtime status (D29), pgmq (D28), budget reservation ledger (D30 follow-up), visitor-created agents (Forge), Convergence, Guilds, Chronicle, public profiles.
+- Synchronizer CSRF token (D12), disabling the Data API entirely (D18).
+- Restore rehearsal, retention automation, operator UI.
 
 ---
 
-## 12. Documents that must change before implementation (not changed by this revision)
-- A new ADR superseding the affected parts of ADR-0001, ADR-0005, ADR-0006 and ADR-0011.
-- `docs/PRD.md` (accounts, verified email, `/login`, `/signup`, `/reset-password`, `/auth/callback`).
-- `docs/ARCHITECTURE.md` §F.1, §F.2, §F.4, §F.7, §H.1, §H.2.
-- `docs/DATA-MODEL.md` §G.1, §G.2, §G.3, §G.5, §G.7, §G.8. The G.8 "as implemented" line already says migration 1 created "fail-closed default privileges", which the current migration file does not do.
-- `docs/SECURITY.md` §I.1, §I.2, §I.3, §I.5, §I.7, §I.8, §I.9.
-- `docs/ROADMAP.md` M2 exit criteria, status row and the `pnpm test:integration` description.
-- The M2 hosted-verification runbook (revision 6 blocked: its revision 5 source exists only in a working session, not as a file).
+## 11. External prerequisites
+| # | Prerequisite | Why necessary | Blocks first beta? | Simpler supported alternative | Must verify before relying on it |
+|---|---|---|---|---|---|
+| P1 | Custom login roles `sovereign_app` and `sovereign_worker` can connect to the hosted database (pooler or direct) | The only way to avoid `postgres`/`service_role` at runtime | **Yes** | Direct connection instead of the pooler | A test connection as each role on the development project; the exact user-name format for the pooler |
+| P2 | `postgres` can create the `NOLOGIN` role `sovereign_owner` and transfer function ownership to it | Limits what function bodies can reach (§7.2) | **Yes**, unless the weaker fallback is approved | Functions owned by `postgres` — weaker, **needs explicit approval** (D15) | Run the role creation and `ALTER FUNCTION … OWNER TO` on the development project |
+| P3 | Transaction-local `set_config` behaves correctly through the chosen connection mode | Visitor context must not leak between requests (§7.6) | **Yes** | Session-mode pooler or direct connection with a small server-side pool | Pool-isolation tests (§12.3) |
+| P4 | A PostgreSQL driver for Node (new dependency) compatible with the chosen pooler mode | The web server and worker must talk SQL | **Yes** | — (Supabase JS clients would require `service_role` or Supabase Auth, both excluded) | Dependency approval under the repository's supply-chain policy; prepared-statement behaviour in transaction mode |
+| P5 | Hosting for the web app **and** a long-running worker process, with secret storage and outbound access to the model provider | Tasks outlive request handlers; secrets must stay server-side | **Yes** | Run the worker as a second process on the same host as the web app | Host chosen by the client (D37); worker can run continuously; secrets not exposed in logs or build output |
+| P6 | Model provider account, API key, chosen model, and (if offered) a provider-side spend limit | Agents need a model; spend must be capped | **Yes** for the key and model; spend limit is a strong backstop | In-app token ceiling only (D30) | Key works from the worker host; the provider console's spend-limit feature exists and is set |
+| P7 | Trusted client-IP header on the chosen host | Per-network provisioning limits (§6.3) | No (client decision D14); **yes before increasing traffic** | Global ceilings only | Host documentation **and** a test that a client-supplied header is overwritten |
+| P8 | Backup capability of the hosted plan | Recovering visitors' workspaces after a database loss | No, if the client accepts the risk (D36) | Accept loss for the beta | The plan's documented backup features |
+| P9 | `pg_cron` or another scheduler | Automated cleanup | No | Manual operator cleanup (§9.3) | — |
 
-## 13. Hosted verification
-The hosted-verification runbook must follow this specification once approved, with the owner-defined gates G1–G9. Its test expectations can be stated only after the tests in §9 exist. §6.10 lists the hosted facts it must verify first; the development setup script for test cleanup (§6.8) is an operator step it must include.
+No item above is assumed to be supported by Supabase or the host; each needs the stated evidence.
+
+---
+
+## 12. Testing requirements (none of these tests exists; no counts are stated)
+
+### 12.1 Unit (offline)
+- Token generation, hashing, cookie attributes (production and localhost), `Max-Age` equal to remaining lifetime.
+- CSRF checks: missing or foreign `Origin` rejected; `Sec-Fetch-Site: cross-site` rejected; forwarding headers ignored unless configured.
+- Task input validation: empty, oversize, control characters, unknown or disabled agent, missing idempotency key.
+- Agent catalogue: every enabled agent has instructions, a model, an output cap; instructions never reach client bundles.
+- Retry classification of provider errors; backoff; attempt cap; truncation flag on token-cap stop.
+- Markdown sanitiser: no raw HTML, no `javascript:` links.
+- Logs never contain tokens, hashes, cookie values, Task text, outputs or IPs.
+- Static guards: no session-level `SET` in application SQL; no database URL or model key in client code.
+
+### 12.2 Database / RLS (pgTAP via `pnpm test:rls`, control file first, all rolled back)
+- Session states and boundaries (`expires_at` exactly `now()` → `expired`); renewal only when due; revoked sessions resolve to nothing.
+- Provisioning creates exactly one visitor, workspace and session; global and per-network limits; `null` network subject skips only the per-network limit.
+- `submit_task`: workspace from context only; kill switch; global and per-visitor limits; idempotent resubmission returns the same Task and does not count twice; no context → `no_visitor`.
+- `cancel_task`: queued → cancelled; running → `cancel_requested`; terminal → `not_cancellable`; another visitor's Task → `not_found` and unchanged.
+- Isolation as `sovereign_app`: visitor A sees none of B's visitors, workspaces or Tasks; spoofed context (fabricated hash, B's visitor id) sees nothing; no direct `INSERT`/`UPDATE`/`DELETE` succeeds anywhere.
+- As `sovereign_worker`: can claim and complete Tasks; cannot read `visitors` or `visitor_sessions`; cannot insert or delete Tasks; a completion with a stale lease token changes nothing.
+- Constraints: status/lease/output/error/finished consistency checks; one workspace per visitor.
+- Catalog: role attributes; function owner, `prosecdef`, `search_path=""`, no `EXECUTE`/`format(` in bodies, exact `EXECUTE` grants; exact table and column privileges per role; RLS enabled on every table; exact policy set.
+
+### 12.3 Integration (against the hosted development project, with a fake model provider by default)
+- Pool isolation: one-connection pool, A's context then no context sees nothing; interleaved A/B transactions never cross.
+- Worker lifecycle with the fake provider: success; retryable error then success; retryable errors until `failed`; terminal error; timeout; worker killed mid-call → lease expiry → re-claim → single final result; cancel while queued and while running; queue timeout; kill switch stops claiming; token ceiling stops claiming.
+- Concurrency: several workers never claim the same Task; duplicate submissions with one idempotency key create one Task.
+- One opt-in live smoke test against the real provider with a tiny prompt and output cap.
+- Test-data cleanup per §12.5.
+
+### 12.4 Browser (manual until an E2E tool is approved)
+- Fresh profile → workspace without any form; submit a Task; close the tab; return → result shown.
+- Reload and browser restart keep the same workspace and Tasks.
+- Delete or tamper with the cookie → notice; "Start a new workspace" works.
+- Two profiles see only their own Tasks; a copied Task URL shows nothing to the other profile.
+- A cross-site page posting to a Server Action changes nothing.
+- Limits reached → generic messages; kill switch → "Agents are paused".
+
+### 12.5 Test-data cleanup (development project only)
+- Integration tests record every visitor they create and use the reserved username prefix `zz-test-`.
+- The harness requires `SOVEREIGN_TEST_EXPECTED_PROJECT_REF` and a cleanup database URL (no defaults, no fallback to other variables). Before deleting it verifies that the URL names the expected project and that `private.test_environment` (a one-row marker created only by a development setup script, never by a migration) holds `environment = 'development'` and the expected ref. Any mismatch aborts with no `DELETE`.
+- It deletes only recorded visitor ids that also carry the prefix, checks the deleted count, and verifies nothing related remains.
+- No cleanup privilege exists in production; `sovereign_app` and `sovereign_worker` have no `DELETE`.
+
+---
+
+## 13. Decision register
+
+Status: **ACCEPTED** (kept in this revision) · **REVISED** · **DEFERRED** · **REJECTED** · **NEEDS CLIENT DECISION**. Approval: **Client** = confirmed by the client; **Rec.** = recommendation awaiting client approval. Nothing marked Rec. is approved.
+
+| # | Decision | Status | Approval | Notes / evidence needed |
+|---|---|---|---|---|
+| D1 | Accountless visitors; server-generated id; HttpOnly bearer session; no Supabase Auth; username display-only; same-profile persistence; no cross-device recovery; no wallet or on-chain features | ACCEPTED | **Client** (2026-11-12, scope confirmed 2026-11-13) | |
+| D2 | Tables in non-exposed `sovereign`, support objects in `private` | ACCEPTED | Rec. | |
+| D3 | Generated username `adjective-noun-NN`, format check | REVISED | Rec. | Uniqueness removed |
+| D4 | Unique usernames | DEFERRED | Rec. | Needed only with public profiles |
+| D5 | Reserved-name denylist | REVISED | Rec. | Only the test prefix `zz-test-` matters while names are generated |
+| D6 | `GET` never creates rows; provisioning by same-origin `POST` | ACCEPTED | Rec. | |
+| D7 | Invalid-cookie notice; "Start a new workspace"; "Forget this browser" | REVISED | Rec. | Simplified, no nonce (§4.6) |
+| D8 | Sliding idle lifetime, renewal ≥ 24 h apart in a Server Action | REVISED | **NEEDS CLIENT DECISION** on the value | Proposed 90 days |
+| D9 | Cookie name `__Host-sovereign_session` | REVISED | Rec. | Nonce cookie removed |
+| D10 | Rotation, lineage, grace, reuse detection | DEFERRED | Rec. | Trade-off §4.8 |
+| D11 | Retention and scheduled cleanup | REVISED | Rec. | Manual operator cleanup (§9.3); scheduling deferred |
+| D12 | Synchronizer CSRF token | DEFERRED | Rec. | |
+| D13 | Rate limiting mandatory before public exposure | REVISED | **Client** (mandatory); values Rec. | Now covers provisioning and Task execution (§6) |
+| D14 | Per-network limits from a trusted client-IP header | **NEEDS CLIENT DECISION** | — | Launch with global ceilings only, or wait for a verified header (P7) |
+| D15 | Functions owned by `NOLOGIN` `sovereign_owner` | REVISED | Rec. | One owner role; `postgres` ownership only with explicit approval if P2 fails |
+| D16 | PostgreSQL driver and connection mode | **NEEDS CLIENT DECISION** | — | Dependency approval + P1/P3/P4 evidence |
+| D17 | Deferrable "visitor has a workspace" trigger | DEFERRED | Rec. | Single insert path suffices for the beta |
+| D18 | Disable the Data API entirely | DEFERRED | Rec. | Unused either way |
+| D19 | Proxy sets a provisioning nonce | REJECTED | Rec. | Nonce removed; no proxy logic needed |
+| D20 | Test-data cleanup safeguards | REVISED | Rec. | Marker + expected ref kept; dedicated role removed (§12.5) |
+| D21 | Provisioning nonce idempotency | REJECTED | Rec. | Duplicate empty visitors accepted (§4.5) |
+| D22 | Session events table | DEFERRED | Rec. | With rotation |
+| D23 | Username editing via function | DEFERRED | Rec. | |
+| D24 | Network subject with key versioning | REVISED | Rec. | Single HMAC key, no versioning; only if D14 enables it |
+| D25 | Beta Task model: one table `sovereign.tasks` as the single source of truth; statuses queued/running/succeeded/failed/cancelled | ACCEPTED (new) | Rec. | Maps to quests/agent_runs later |
+| D26 | Platform-defined agent catalogue in code; which agents and their instructions | **NEEDS CLIENT DECISION** | — | List of agents and approved instructions |
+| D27 | No agent tools in the first beta | **NEEDS CLIENT DECISION** | — | Recommended: none; tools add a search provider, SSRF and cost risk |
+| D28 | Worker claims with `SKIP LOCKED` + lease; no pgmq; `sovereign_worker` has narrow direct table grants on `tasks` | ACCEPTED (new) | Rec. | Option already evaluated in ARCHITECTURE §F.8. Deviates from ADR-0003's function-only worker API, which is deferred with the full runtime |
+| D29 | Polling for status; no Realtime | ACCEPTED (new) | Rec. | |
+| D30 | Cost controls of §6.2 and their values; provider-side spend limit | **NEEDS CLIENT DECISION** | — | Values from a cost model; whether the provider's spend limit is set |
+| D31 | Per-visitor limits (active, daily) | ACCEPTED (new) | Rec. | Values part of D30 |
+| D32 | Model provider and model | **NEEDS CLIENT DECISION** | — | Anthropic per ADR-0001; specific model and price |
+| D33 | One bounded model call per attempt; at most 2 attempts; queue timeout | ACCEPTED (new) | Rec. | |
+| D34 | Output rendered through a markdown allowlist sanitiser | ACCEPTED (new) | Rec. | Sanitiser library may need dependency approval |
+| D35 | Task-input notice, privacy statement, Task retention | **NEEDS CLIENT DECISION** | — | Wording and retention period |
+| D36 | Backups for the beta | **NEEDS CLIENT DECISION** | — | Plan's backup features, or accept loss |
+| D37 | Hosting for web and worker | **NEEDS CLIENT DECISION** | — | Host(s) and whether the worker shares the web host |
+
+---
+
+## 14. Remaining unknowns and the evidence needed
+| Unknown | Evidence or answer needed | From |
+|---|---|---|
+| Custom roles via pooler (P1), owner role (P2), context isolation (P3) | Test connection, role creation and pool-isolation test results on the development project | Hosted verification |
+| Driver choice (P4) | Dependency review and approval | Client / maintainer |
+| Hosting and worker placement (P5, D37) | Chosen host(s) and their process and secret model | Client |
+| Trusted client IP (P7, D14) | Host documentation plus a spoofed-header test | Client + hosted verification |
+| Model, prices and spend-limit feature (P6, D32, D30) | Chosen model, current published prices, provider console capability | Client |
+| Agent list and instructions (D26), tools (D27) | Approved agent definitions | Client |
+| Limit values (D30) | Cost model: expected visitors and Tasks per day, tolerated daily spend | Client |
+| Backups (D36), privacy and retention (D35) | Plan features; client's position | Client |
+| Status of the old account-based work in Git (§8.1) | Read-only Git evidence | Client authorises a read-only Git check |
+
+---
+
+## 15. Documents that must change before implementation (not changed by this revision)
+- A new ADR recording accountless visitors, the beta Task model and the simplifications above, superseding the affected parts of ADR-0001, ADR-0003, ADR-0005, ADR-0006 and ADR-0011.
+- `docs/PRD.md` (accounts, verified-email gate, routes, MVP scope for the beta).
+- `docs/ARCHITECTURE.md` §F.1, §F.2, §F.5, §F.7, §F.8, §F.9, §H (beta deviations).
+- `docs/DATA-MODEL.md` §G (identity tables, Tasks, roles). The G.8 "as implemented" line already misdescribes migration 1.
+- `docs/SECURITY.md` §I (trust boundaries, privilege model, verified-email gate removal).
+- `docs/ROADMAP.md` (M2 scope and status, beta launch milestone).
+- The M2 hosted-verification runbook (must be rewritten for this design; its previous revisions exist only in a working session, not as a file).
